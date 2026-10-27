@@ -19,6 +19,7 @@ package schemaclaim_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -374,6 +375,72 @@ func TestEnsure_ReadOnlyGrantsConnectWithoutDatabaseCreate(t *testing.T) {
 	g.Expect(pg.grantedDBCreate).To(Equal(0))
 }
 
+func TestEnsure_InternalInstallsExtensionsBeforeSchema(t *testing.T) {
+	g := NewWithT(t)
+	claim := sampleClaim()
+	claim.Spec.Extensions = []string{"vector"}
+	pg := &trackingClient{
+		cfg:       providerConfig(),
+		databases: map[string]bool{"analytics": true},
+	}
+
+	_, err := ensure(t, claim, internalProvider(), pg)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pg.createdSchemas).To(ContainElement("myschema"))
+	g.Expect(pg.execSQLsContainingCreateExtension("vector")).To(BeTrue())
+}
+
+func TestEnsure_ExternalMissingExtensionReturnsNotAvailable(t *testing.T) {
+	g := NewWithT(t)
+	claim := sampleClaim()
+	claim.Spec.Extensions = []string{"vector"}
+	provider := &infraApi.DatabaseProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "external"},
+		Spec: infraApi.DatabaseProviderSpec{
+			Type:     infraApi.ProviderTypeExternal,
+			External: &infraApi.ExternalProviderSpec{},
+		},
+	}
+	pg := &trackingClient{
+		cfg:                      providerConfig(),
+		databases:                map[string]bool{"analytics": true},
+		extensionAvailableByName: map[string]bool{"vector": false},
+	}
+
+	_, err := ensure(t, claim, provider, pg)
+	var missing claimerrors.ExtensionNotAvailable
+	g.Expect(errors.As(err, &missing)).To(BeTrue())
+	g.Expect(missing.Extensions).To(Equal([]string{"vector"}))
+	g.Expect(pg.execSQLsContainingCreateExtension("vector")).To(BeFalse())
+}
+
+func TestEnsure_ExternalAvailableExtensionNeverCreates(t *testing.T) {
+	g := NewWithT(t)
+	claim := sampleClaim()
+	claim.Spec.Extensions = []string{"vector"}
+	provider := &infraApi.DatabaseProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "external"},
+		Spec: infraApi.DatabaseProviderSpec{
+			Type: infraApi.ProviderTypeExternal,
+			External: &infraApi.ExternalProviderSpec{
+				Capabilities: []infraApi.ExternalCapability{
+					infraApi.ExternalCapabilityCreateSchema,
+				},
+			},
+		},
+	}
+	pg := &trackingClient{
+		cfg:                      providerConfig(),
+		databases:                map[string]bool{"analytics": true},
+		extensionAvailableByName: map[string]bool{"vector": true},
+	}
+
+	_, err := ensure(t, claim, provider, pg)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pg.execSQLsContainingCreateExtension("vector")).To(BeFalse())
+	g.Expect(pg.createdSchemas).To(ContainElement("myschema"))
+}
+
 func ensure(
 	t *testing.T,
 	claim *infraApi.SchemaClaim,
@@ -398,6 +465,7 @@ func ensure(
 				schemaOwners:               pg.schemaOwners,
 				roles:                      pg.roles,
 				forceCreateSchemaDuplicate: pg.forceCreateSchemaDuplicate,
+				extensionAvailableByName:   pg.extensionAvailableByName,
 				parent:                     pg,
 			}, nil
 		},
@@ -518,7 +586,20 @@ type trackingClient struct {
 	createdRoles               []string
 	grantedConnect             int
 	grantedDBCreate            int
+	extensionAvailableByName   map[string]bool
+	execSQLs                   []string
 	parent                     *trackingClient
+}
+
+func (t *trackingClient) execSQLsContainingCreateExtension(name string) bool {
+	root := t.root()
+	for _, stmt := range root.execSQLs {
+		upper := strings.ToUpper(stmt)
+		if strings.Contains(upper, "CREATE EXTENSION") && strings.Contains(stmt, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *trackingClient) root() *trackingClient {
@@ -536,6 +617,7 @@ func (t *trackingClient) Ping(context.Context) error {
 
 func (t *trackingClient) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
 	root := t.root()
+	root.execSQLs = append(root.execSQLs, query)
 	if root.databases == nil {
 		root.databases = map[string]bool{}
 	}
@@ -612,6 +694,13 @@ func (t *trackingClient) QueryRow(_ context.Context, query string, args ...any) 
 		return boolRow{root.roles[name]}, nil
 	case strings.Contains(query, "HAS_DATABASE_PRIVILEGE"), strings.Contains(query, "HAS_SCHEMA_PRIVILEGE"):
 		return boolRow{false}, nil
+	case strings.Contains(query, "pg_available_extensions"):
+		name, _ := args[0].(string)
+		avail := false
+		if root.extensionAvailableByName != nil {
+			avail = root.extensionAvailableByName[name]
+		}
+		return boolRow{avail}, nil
 	default:
 		return boolRow{false}, nil
 	}

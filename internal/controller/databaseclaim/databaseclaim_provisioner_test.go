@@ -18,6 +18,7 @@ package databaseclaim_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -51,6 +52,7 @@ func TestEnsure_CreatesNamedDatabaseWhenAllowed(t *testing.T) {
 		Provider:       provider,
 		Postgres:       pg,
 		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
 	}.Ensure(context.Background())
 
 	g.Expect(err).NotTo(HaveOccurred())
@@ -82,6 +84,7 @@ func TestEnsure_DeniesCreateOnExternalWithoutCapability(t *testing.T) {
 		Provider:       provider,
 		Postgres:       pg,
 		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
 	}.Ensure(context.Background())
 
 	g.Expect(err).To(MatchError(claimerrors.DatabaseCreateNotAllowed{Database: "analytics"}))
@@ -99,6 +102,7 @@ func TestEnsure_DefaultDatabaseMissingIsNotCreated(t *testing.T) {
 		Provider:       internalProvider(),
 		Postgres:       pg,
 		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
 	}.Ensure(context.Background())
 
 	g.Expect(err).To(MatchError(claimerrors.DatabaseNotFound{Database: "postgres"}))
@@ -120,11 +124,13 @@ func TestEnsure_DistinctClaimsGetDistinctRoles(t *testing.T) {
 
 	secretA, err := databaseclaim.DatabaseProvisioner{
 		Client: cli, Claim: a, Provider: internalProvider(), Postgres: pg, ProviderConfig: providerConfig(),
+		ClientFactory: testDBClientFactory(pg),
 	}.Ensure(context.Background())
 	g.Expect(err).NotTo(HaveOccurred())
 
 	secretB, err := databaseclaim.DatabaseProvisioner{
 		Client: cli, Claim: b, Provider: internalProvider(), Postgres: pg, ProviderConfig: providerConfig(),
+		ClientFactory: testDBClientFactory(pg),
 	}.Ensure(context.Background())
 	g.Expect(err).NotTo(HaveOccurred())
 
@@ -149,6 +155,7 @@ func TestEnsure_RotatesPasswordWhenSecretMissingButRoleExists(t *testing.T) {
 		Provider:       internalProvider(),
 		Postgres:       pg,
 		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
 	}.Ensure(context.Background())
 
 	g.Expect(err).NotTo(HaveOccurred())
@@ -181,6 +188,7 @@ func TestEnsure_RotatesPasswordWhenSecretPasswordEmpty(t *testing.T) {
 		Provider:       internalProvider(),
 		Postgres:       pg,
 		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
 	}.Ensure(context.Background())
 
 	g.Expect(err).NotTo(HaveOccurred())
@@ -212,6 +220,7 @@ func TestEnsure_CreatesNamedDatabaseOnExternalWhenAllowed(t *testing.T) {
 		Provider:       provider,
 		Postgres:       pg,
 		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
 	}.Ensure(context.Background())
 
 	g.Expect(err).NotTo(HaveOccurred())
@@ -235,6 +244,7 @@ func TestEnsure_DoesNotMarkDatabaseCreatedWhenPreexisting(t *testing.T) {
 		Provider:       internalProvider(),
 		Postgres:       pg,
 		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
 	}.Ensure(context.Background())
 
 	g.Expect(err).NotTo(HaveOccurred())
@@ -257,11 +267,110 @@ func TestEnsure_ReadOnlyGrantsConnectWithoutCreate(t *testing.T) {
 		Provider:       internalProvider(),
 		Postgres:       pg,
 		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
 	}.Ensure(context.Background())
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(pg.grantedConnect).To(Equal(1))
 	g.Expect(pg.grantedCreate).To(Equal(0))
+}
+
+func TestEnsure_InternalInstallsExtensionsBeforeRole(t *testing.T) {
+	g := NewWithT(t)
+	claim := sampleClaim("analytics")
+	claim.Spec.Extensions = []string{"vector"}
+	pg := &trackingClient{
+		cfg:       providerConfig(),
+		databases: map[string]bool{"analytics": true},
+	}
+
+	_, err := databaseclaim.DatabaseProvisioner{
+		Client:         fakeClient(t),
+		Claim:          claim,
+		Provider:       internalProvider(),
+		Postgres:       pg,
+		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
+	}.Ensure(context.Background())
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pg.execSQLsContainingCreateExtension("vector")).To(BeTrue())
+	g.Expect(pg.createdRoles).NotTo(BeEmpty())
+}
+
+func TestEnsure_ExternalMissingExtensionReturnsNotAvailable(t *testing.T) {
+	g := NewWithT(t)
+	claim := sampleClaim("analytics")
+	claim.Spec.Extensions = []string{"vector"}
+	provider := &infraApi.DatabaseProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "external"},
+		Spec: infraApi.DatabaseProviderSpec{
+			Type:     infraApi.ProviderTypeExternal,
+			External: &infraApi.ExternalProviderSpec{},
+		},
+	}
+	pg := &trackingClient{
+		cfg:                      providerConfig(),
+		databases:                map[string]bool{"analytics": true},
+		extensionAvailableByName: map[string]bool{"vector": false},
+	}
+
+	_, err := databaseclaim.DatabaseProvisioner{
+		Client:         fakeClient(t),
+		Claim:          claim,
+		Provider:       provider,
+		Postgres:       pg,
+		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
+	}.Ensure(context.Background())
+
+	var missing claimerrors.ExtensionNotAvailable
+	g.Expect(errors.As(err, &missing)).To(BeTrue())
+	g.Expect(missing.Extensions).To(Equal([]string{"vector"}))
+	g.Expect(pg.execSQLsContainingCreateExtension("vector")).To(BeFalse())
+}
+
+func TestEnsure_ExternalAvailableExtensionNeverCreates(t *testing.T) {
+	g := NewWithT(t)
+	claim := sampleClaim("analytics")
+	claim.Spec.Extensions = []string{"vector"}
+	provider := &infraApi.DatabaseProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "external"},
+		Spec: infraApi.DatabaseProviderSpec{
+			Type:     infraApi.ProviderTypeExternal,
+			External: &infraApi.ExternalProviderSpec{},
+		},
+	}
+	pg := &trackingClient{
+		cfg:                      providerConfig(),
+		databases:                map[string]bool{"analytics": true},
+		extensionAvailableByName: map[string]bool{"vector": true},
+	}
+
+	_, err := databaseclaim.DatabaseProvisioner{
+		Client:         fakeClient(t),
+		Claim:          claim,
+		Provider:       provider,
+		Postgres:       pg,
+		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
+	}.Ensure(context.Background())
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pg.execSQLsContainingCreateExtension("vector")).To(BeFalse())
+	g.Expect(pg.createdRoles).NotTo(BeEmpty())
+}
+
+func testDBClientFactory(pg *trackingClient) postgres.ClientFactory {
+	return func(_ context.Context, cfg postgres.Config) (postgres.Client, error) {
+		return &trackingClient{
+			cfg:                      cfg,
+			databases:                pg.databases,
+			roles:                    pg.roles,
+			extensionAvailableByName: pg.extensionAvailableByName,
+			parent:                   pg,
+		}, nil
+	}
 }
 
 func sampleClaim(database string) *infraApi.DatabaseClaim {
@@ -301,14 +410,35 @@ func fakeClient(t *testing.T, objs ...client.Object) client.Client {
 }
 
 type trackingClient struct {
-	cfg              postgres.Config
-	databases        map[string]bool
-	roles            map[string]bool
-	createdDatabases []string
-	createdRoles     []string
-	passwordSets     int
-	grantedConnect   int
-	grantedCreate    int
+	cfg                      postgres.Config
+	databases                map[string]bool
+	roles                    map[string]bool
+	createdDatabases         []string
+	createdRoles             []string
+	passwordSets             int
+	grantedConnect           int
+	grantedCreate            int
+	extensionAvailableByName map[string]bool
+	execSQLs                 []string
+	parent                   *trackingClient
+}
+
+func (t *trackingClient) root() *trackingClient {
+	if t.parent != nil {
+		return t.parent
+	}
+	return t
+}
+
+func (t *trackingClient) execSQLsContainingCreateExtension(name string) bool {
+	root := t.root()
+	for _, sql := range root.execSQLs {
+		upper := strings.ToUpper(sql)
+		if strings.Contains(upper, "CREATE EXTENSION") && strings.Contains(sql, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *trackingClient) Config() postgres.Config { return t.cfg }
@@ -318,27 +448,29 @@ func (t *trackingClient) Ping(context.Context) error {
 }
 
 func (t *trackingClient) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	if t.databases == nil {
-		t.databases = map[string]bool{}
+	root := t.root()
+	root.execSQLs = append(root.execSQLs, sql)
+	if root.databases == nil {
+		root.databases = map[string]bool{}
 	}
-	if t.roles == nil {
-		t.roles = map[string]bool{}
+	if root.roles == nil {
+		root.roles = map[string]bool{}
 	}
 	switch {
 	case strings.Contains(sql, "CREATE DATABASE"):
 		name := lastQuotedIdent(sql)
-		t.databases[name] = true
-		t.createdDatabases = append(t.createdDatabases, name)
+		root.databases[name] = true
+		root.createdDatabases = append(root.createdDatabases, name)
 	case strings.Contains(sql, "CREATE ROLE"):
 		name := firstQuotedIdent(sql)
-		t.roles[name] = true
-		t.createdRoles = append(t.createdRoles, name)
+		root.roles[name] = true
+		root.createdRoles = append(root.createdRoles, name)
 	case strings.Contains(sql, "ALTER ROLE") && strings.Contains(sql, "PASSWORD"):
-		t.passwordSets++
+		root.passwordSets++
 	case strings.Contains(sql, "GRANT CONNECT ON DATABASE"):
-		t.grantedConnect++
+		root.grantedConnect++
 	case strings.Contains(sql, "GRANT CREATE ON DATABASE"):
-		t.grantedCreate++
+		root.grantedCreate++
 	}
 	return pgconn.CommandTag{}, nil
 }
@@ -348,21 +480,29 @@ func (t *trackingClient) Query(context.Context, string, ...any) (pgx.Rows, error
 }
 
 func (t *trackingClient) QueryRow(_ context.Context, sql string, args ...any) (pgx.Row, error) {
-	if t.databases == nil {
-		t.databases = map[string]bool{}
+	root := t.root()
+	if root.databases == nil {
+		root.databases = map[string]bool{}
 	}
-	if t.roles == nil {
-		t.roles = map[string]bool{}
+	if root.roles == nil {
+		root.roles = map[string]bool{}
 	}
 	switch {
 	case strings.Contains(sql, "pg_database"):
 		name, _ := args[0].(string)
-		return boolRow{t.databases[name]}, nil
+		return boolRow{root.databases[name]}, nil
 	case strings.Contains(sql, "pg_roles"):
 		name, _ := args[0].(string)
-		return boolRow{t.roles[name]}, nil
+		return boolRow{root.roles[name]}, nil
 	case strings.Contains(sql, "HAS_DATABASE_PRIVILEGE"):
 		return boolRow{false}, nil
+	case strings.Contains(sql, "pg_available_extensions"):
+		name, _ := args[0].(string)
+		avail := false
+		if root.extensionAvailableByName != nil {
+			avail = root.extensionAvailableByName[name]
+		}
+		return boolRow{avail}, nil
 	default:
 		return boolRow{false}, nil
 	}

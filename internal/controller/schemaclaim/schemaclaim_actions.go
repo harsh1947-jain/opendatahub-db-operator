@@ -150,6 +150,13 @@ func (m *Controller) provisionAction(ctx context.Context, rr *odhtypes.Reconcili
 			conditions.WithMessage(secretNotOwned.Error()))
 		return odherrors.NewStopErrorW(secretNotOwned)
 	}
+	if missingExt, ok := errors.AsType[claimerrors.ExtensionNotAvailable](err); ok {
+		rr.Conditions.Mark(ConditionProvisioned, metav1.ConditionFalse,
+			conditions.WithReason("ExtensionNotAvailable"),
+			conditions.WithMessage(missingExt.Error()))
+		// Terminal: admin must install the extension or change the claim.
+		return odherrors.NewStopErrorW(missingExt)
+	}
 	if err != nil {
 		rr.Conditions.Mark(ConditionProvisioned, metav1.ConditionFalse,
 			conditions.WithError(err))

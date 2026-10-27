@@ -374,3 +374,33 @@ func TestDDL_DatabaseExists(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(notExists).To(BeFalse())
 }
+
+// TestDDL_ExtensionAvailable verifies pg_available_extensions lookups against
+// a live server. plpgsql ships with Postgres; a nonsense name must be absent.
+func TestDDL_ExtensionAvailable(t *testing.T) {
+	g := NewWithT(t)
+	cfg := startPostgres(t)
+
+	ctx := t.Context()
+	pool := openPool(t, cfg)
+
+	available, err := postgres.ExtensionAvailable(ctx, pool, "plpgsql")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(available).To(BeTrue())
+
+	absent, err := postgres.ExtensionAvailable(ctx, pool, "totally_nonexistent_ext_xyz")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(absent).To(BeFalse())
+}
+
+func TestDDL_MissingExtensions(t *testing.T) {
+	g := NewWithT(t)
+	cfg := startPostgres(t)
+
+	ctx := t.Context()
+	pool := openPool(t, cfg)
+
+	missing, err := postgres.MissingExtensions(ctx, pool, []string{"plpgsql", "totally_nonexistent_ext_xyz"})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(missing).To(Equal([]string{"totally_nonexistent_ext_xyz"}))
+}

@@ -82,6 +82,19 @@ spec:
                 - Retain
                 - Delete
                 type: string
+              extensions:
+                description: |-
+                  Extensions lists PostgreSQL extensions this claim requires in its target
+                  database. Day-one allow-list is vector only. Immutable once set.
+                items:
+                  enum:
+                  - vector
+                  type: string
+                type: array
+                x-kubernetes-list-type: atomic
+                x-kubernetes-validations:
+                - message: extensions are immutable once set
+                  rule: self == oldSelf
               provider:
                 description: Provider selects the DatabaseProvider to provision against.
                 properties:
@@ -182,6 +195,8 @@ spec:
               rule: has(oldSelf.schema) == has(self.schema)
             - message: database cannot be added or removed after claim creation
               rule: has(oldSelf.database) == has(self.database)
+            - message: extensions cannot be added or removed after claim creation
+              rule: has(oldSelf.extensions) == has(self.extensions)
           status:
             description: |-
               SchemaClaimStatus defines the observed state of SchemaClaim. Phase (human-

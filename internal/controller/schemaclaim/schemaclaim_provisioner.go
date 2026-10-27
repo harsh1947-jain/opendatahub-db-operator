@@ -96,6 +96,10 @@ func (p SchemaProvisioner) Ensure(ctx context.Context) (*corev1.Secret, error) {
 	}
 	defer dbClient.Close()
 
+	if err := dbcontroller.EnsureClaimExtensions(ctx, dbClient, p.Provider, p.Claim.Spec.Extensions); err != nil {
+		return nil, dbcontroller.WrapQuickRetry("ensuring claim extensions", err)
+	}
+
 	schema := p.Schema()
 	if err := p.ensureSchema(ctx, dbClient, schema); err != nil {
 		return nil, err

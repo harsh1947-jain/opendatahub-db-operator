@@ -20,8 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	. "github.com/onsi/gomega"
 	fwapi "github.com/opendatahub-io/odh-platform-utilities/framework/api"
 	odherrors "github.com/opendatahub-io/odh-platform-utilities/framework/controller/actions/errors"
@@ -38,6 +41,8 @@ import (
 
 	infraApi "github.com/opendatahub-io/opendatahub-db-operator/api/infrastructure/v1alpha1"
 	moduleconfig "github.com/opendatahub-io/opendatahub-db-operator/pkg/config"
+	"github.com/opendatahub-io/opendatahub-db-operator/pkg/controller/claimerrors"
+	"github.com/opendatahub-io/opendatahub-db-operator/pkg/postgres"
 )
 
 func TestProvisionAction_PersistsProviderBindingBeforeEnsure(t *testing.T) {
@@ -83,6 +88,75 @@ func TestProvisionAction_PersistsProviderBindingBeforeEnsure(t *testing.T) {
 	g.Expect(provisioned.Reason).To(Equal("ProviderBound"))
 }
 
+func TestProvisionAction_ExtensionNotAvailable(t *testing.T) {
+	g := NewWithT(t)
+
+	provider := &infraApi.DatabaseProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "sample-external"},
+		Spec: infraApi.DatabaseProviderSpec{
+			Type: infraApi.ProviderTypeExternal,
+			External: &infraApi.ExternalProviderSpec{
+				ConnectionSecretRef: corev1.SecretReference{
+					Namespace: "db-admin",
+					Name:      "external-admin",
+				},
+			},
+		},
+		Status: infraApi.DatabaseProviderStatus{
+			Status: fwapi.Status{
+				Conditions: []fwapi.Condition{{
+					Type:   "Reachable",
+					Status: metav1.ConditionTrue,
+				}},
+			},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-admin", Namespace: "db-admin"},
+		Data: map[string][]byte{
+			postgres.SecretKeyHost:     []byte("postgres.db-admin.svc"),
+			postgres.SecretKeyPort:     []byte("5432"),
+			postgres.SecretKeyUser:     []byte("postgres"),
+			postgres.SecretKeyPassword: []byte("secret"),
+			postgres.SecretKeyDatabase: []byte("postgres"),
+		},
+	}
+	claim := &infraApi.DatabaseClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "analytics", Namespace: "app"},
+		Spec: infraApi.DatabaseClaimSpec{
+			Provider:   infraApi.ProviderRef{Name: "sample-external"},
+			Database:   "analytics",
+			Extensions: []string{"vector"},
+		},
+		Status: infraApi.DatabaseClaimStatus{Provider: "sample-external"},
+	}
+	pg := &extensionProvisionPG{
+		databases:          map[string]bool{"analytics": true},
+		extensionAvailable: map[string]bool{"vector": false},
+	}
+	cli := fake.NewClientBuilder().WithScheme(claimTestScheme(t)).WithObjects(provider, secret, claim).Build()
+	m := &Controller{Options: Options{
+		cfg: &moduleconfig.Config{OperatorNamespace: "odh-db-operator-system"},
+		PostgresClientFactory: func(_ context.Context, _ postgres.Config) (postgres.Client, error) {
+			return pg, nil
+		},
+	}}
+
+	err := m.provisionAction(context.Background(), claimTestRequest(t, cli, claim))
+	g.Expect(err).To(HaveOccurred())
+	var stop odherrors.StopError
+	g.Expect(errors.As(err, &stop)).To(BeTrue())
+	var missingExt claimerrors.ExtensionNotAvailable
+	g.Expect(errors.As(err, &missingExt)).To(BeTrue())
+
+	provisioned := conditions.FindStatusCondition(claim, ConditionProvisioned)
+	g.Expect(provisioned).NotTo(BeNil())
+	g.Expect(provisioned.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(provisioned.Reason).To(Equal("ExtensionNotAvailable"))
+	g.Expect(provisioned.Message).To(ContainSubstring("vector"))
+	g.Expect(pg.execSQLsContainingCreateExtension()).To(BeFalse())
+}
+
 func TestSchemaClaimAPIUnavailable(t *testing.T) {
 	g := NewWithT(t)
 	schemaclaimGVK := schema.GroupVersionKind{
@@ -107,6 +181,66 @@ func TestSchemaClaimAPIUnavailable(t *testing.T) {
 		"",
 		errors.New("no RBAC"),
 	))).To(BeFalse(), "Forbidden is a real misconfiguration and should retry")
+}
+
+type extensionProvisionPG struct {
+	databases          map[string]bool
+	extensionAvailable map[string]bool
+	execSQLs           []string
+}
+
+func (p *extensionProvisionPG) Config() postgres.Config { return postgres.Config{} }
+func (p *extensionProvisionPG) Close()                  {}
+func (p *extensionProvisionPG) Ping(context.Context) error {
+	return nil
+}
+
+func (p *extensionProvisionPG) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+	p.execSQLs = append(p.execSQLs, sql)
+	return pgconn.CommandTag{}, nil
+}
+
+func (p *extensionProvisionPG) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, fmt.Errorf("unexpected Query")
+}
+
+func (p *extensionProvisionPG) QueryRow(_ context.Context, query string, args ...any) (pgx.Row, error) {
+	if p.databases == nil {
+		p.databases = map[string]bool{}
+	}
+	name, _ := args[0].(string)
+	switch {
+	case strings.Contains(query, "pg_database"):
+		return extensionBoolRow{p.databases[name]}, nil
+	case strings.Contains(query, "pg_available_extensions"):
+		avail := false
+		if p.extensionAvailable != nil {
+			avail = p.extensionAvailable[name]
+		}
+		return extensionBoolRow{avail}, nil
+	default:
+		return extensionBoolRow{false}, nil
+	}
+}
+
+func (p *extensionProvisionPG) execSQLsContainingCreateExtension() bool {
+	for _, sql := range p.execSQLs {
+		if strings.Contains(strings.ToUpper(sql), "CREATE EXTENSION") {
+			return true
+		}
+	}
+	return false
+}
+
+type extensionBoolRow struct{ v bool }
+
+func (r extensionBoolRow) Scan(dest ...any) error {
+	ptr, ok := dest[0].(*bool)
+	if !ok {
+		return fmt.Errorf("expected *bool")
+	}
+	*ptr = r.v
+	return nil
 }
 
 func claimTestScheme(t *testing.T) *runtime.Scheme {

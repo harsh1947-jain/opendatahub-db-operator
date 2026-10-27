@@ -71,6 +71,8 @@ const (
 
 	sqlCreateExtensionIfNotExists = "CREATE EXTENSION IF NOT EXISTS %s"
 
+	sqlExtensionAvailable = "SELECT EXISTS(SELECT 1 FROM pg_available_extensions WHERE name = $1)"
+
 	sqlDatabaseExists     = "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)"
 	sqlSchemaExists       = "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = $1)"
 	sqlSchemaOwnerComment = "" +
@@ -552,4 +554,36 @@ func CreateExtensionIfNotExists(ctx context.Context, cli Client, extensions []st
 	}
 
 	return nil
+}
+
+// ExtensionAvailable reports whether the named extension is present in
+// pg_available_extensions on the connected server (packaged / loadable).
+// Used for External claim verify; never implies CREATE EXTENSION.
+func ExtensionAvailable(ctx context.Context, cli Client, name string) (bool, error) {
+	row, err := cli.QueryRow(ctx, sqlExtensionAvailable, name)
+	if err != nil {
+		return false, fmt.Errorf("checking extension %q availability: %w", name, err)
+	}
+
+	var available bool
+	if err := row.Scan(&available); err != nil {
+		return false, fmt.Errorf("checking extension %q availability: %w", name, err)
+	}
+	return available, nil
+}
+
+// MissingExtensions returns the subset of names absent from
+// pg_available_extensions. Empty input yields a nil slice.
+func MissingExtensions(ctx context.Context, cli Client, names []string) ([]string, error) {
+	var missing []string
+	for _, name := range names {
+		ok, err := ExtensionAvailable(ctx, cli, name)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			missing = append(missing, name)
+		}
+	}
+	return missing, nil
 }

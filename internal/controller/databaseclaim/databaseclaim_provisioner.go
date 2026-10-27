@@ -37,6 +37,7 @@ type DatabaseProvisioner struct {
 	Provider       *infraApi.DatabaseProvider
 	Postgres       postgres.Client
 	ProviderConfig postgres.Config
+	ClientFactory  postgres.ClientFactory
 }
 
 func (p DatabaseProvisioner) Database() string {
@@ -74,6 +75,18 @@ func (p DatabaseProvisioner) Ensure(ctx context.Context) (*corev1.Secret, error)
 		// Record creation only on this path so DeletionPolicy=Delete cannot
 		// drop a pre-existing database the claim merely bound to.
 		p.Claim.Status.DatabaseCreated = true
+	}
+
+	dbCfg := p.ProviderConfig
+	dbCfg.DBName = database
+	dbClient, err := dbcontroller.OpenClient(ctx, dbCfg, p.ClientFactory)
+	if err != nil {
+		return nil, dbcontroller.WrapQuickRetry("opening database client", err)
+	}
+	defer dbClient.Close()
+
+	if err := dbcontroller.EnsureClaimExtensions(ctx, dbClient, p.Provider, p.Claim.Spec.Extensions); err != nil {
+		return nil, dbcontroller.WrapQuickRetry("ensuring claim extensions", err)
 	}
 
 	role := dbcontroller.RoleNameFor(p.Claim.Namespace, p.Claim.Name)

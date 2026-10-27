@@ -60,6 +60,7 @@ type SchemaConnectionStatus struct {
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.secretName) == has(self.secretName)",message="secretName cannot be added or removed after claim creation"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.schema) == has(self.schema)",message="schema cannot be added or removed after claim creation"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.database) == has(self.database)",message="database cannot be added or removed after claim creation"
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.extensions) == has(self.extensions)",message="extensions cannot be added or removed after claim creation"
 type SchemaClaimSpec struct {
 	// Provider selects the DatabaseProvider to provision against.
 	// +kubebuilder:validation:Required
@@ -104,6 +105,15 @@ type SchemaClaimSpec struct {
 	// +kubebuilder:default=ReadWrite
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="access is immutable once set"
 	Access AccessMode `json:"access,omitempty"`
+
+	// Extensions lists PostgreSQL extensions this claim requires in its target
+	// database. Day-one allow-list is vector only. Immutable once set.
+	//
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:items:Enum=vector
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="extensions are immutable once set"
+	Extensions []string `json:"extensions,omitempty"`
 
 	// DeletionPolicy governs schema+data lifecycle on claim deletion.
 	// +kubebuilder:validation:Enum=Retain;Delete

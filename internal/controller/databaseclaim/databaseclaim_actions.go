@@ -116,6 +116,7 @@ func (m *Controller) provisionAction(ctx context.Context, rr *odhtypes.Reconcili
 		Provider:       provider,
 		Postgres:       pgClient,
 		ProviderConfig: resolvedCfg,
+		ClientFactory:  m.PostgresClientFactory,
 	}
 	secret, err := provisioner.Ensure(ctx)
 	if notFound, ok := errors.AsType[claimerrors.DatabaseNotFound](err); ok {
@@ -130,6 +131,13 @@ func (m *Controller) provisionAction(ctx context.Context, rr *odhtypes.Reconcili
 			conditions.WithMessage(denied.Error()))
 		// Terminal policy denial: do not polite-requeue; wait for a claim/provider change.
 		return odherrors.NewStopErrorW(denied)
+	}
+	if missingExt, ok := errors.AsType[claimerrors.ExtensionNotAvailable](err); ok {
+		rr.Conditions.Mark(ConditionProvisioned, metav1.ConditionFalse,
+			conditions.WithReason("ExtensionNotAvailable"),
+			conditions.WithMessage(missingExt.Error()))
+		// Terminal: admin must install the extension or change the claim.
+		return odherrors.NewStopErrorW(missingExt)
 	}
 	if err != nil {
 		rr.Conditions.Mark(ConditionProvisioned, metav1.ConditionFalse,
