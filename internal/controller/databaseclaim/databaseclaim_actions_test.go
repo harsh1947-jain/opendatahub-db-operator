@@ -36,11 +36,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	infraApi "github.com/opendatahub-io/opendatahub-db-operator/api/infrastructure/v1alpha1"
 	moduleconfig "github.com/opendatahub-io/opendatahub-db-operator/pkg/config"
+	dbcontroller "github.com/opendatahub-io/opendatahub-db-operator/pkg/controller"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/controller/claimerrors"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/postgres"
 )
@@ -146,6 +149,7 @@ func TestProvisionAction_ExtensionNotAvailable(t *testing.T) {
 	g.Expect(err).To(HaveOccurred())
 	var stop odherrors.StopError
 	g.Expect(errors.As(err, &stop)).To(BeTrue())
+	g.Expect(stop.RequeueAfter()).To(Equal(moduleconfig.DefaultRetryInterval))
 	var missingExt claimerrors.ExtensionNotAvailable
 	g.Expect(errors.As(err, &missingExt)).To(BeTrue())
 
@@ -172,15 +176,82 @@ func TestSchemaClaimAPIUnavailable(t *testing.T) {
 		"",
 	))).To(BeTrue(), "NotFound is returned by some discovery paths when the API is missing")
 	g.Expect(schemaClaimAPIUnavailable(fmt.Errorf(
-		"failed to get API group resources: unable to retrieve the complete list of server APIs: %w",
+		"listing schemaclaims: %w",
 		apierrors.NewNotFound(schema.GroupResource{Group: infraApi.GroupName, Resource: "schemaclaims"}, ""),
-	))).To(BeTrue(), "controller-runtime discovery failure must not stick cleanup")
+	))).To(BeTrue(), "wrapped NotFound must unwrap so cleanup is not stuck")
+	g.Expect(schemaClaimAPIUnavailable(errors.New("failed to get API group resources"))).
+		To(BeFalse(), "English discovery wording alone is not a typed unavailable signal")
 	g.Expect(schemaClaimAPIUnavailable(errors.New("Unauthorized"))).To(BeFalse())
 	g.Expect(schemaClaimAPIUnavailable(apierrors.NewForbidden(
 		schema.GroupResource{Group: infraApi.GroupName, Resource: "schemaclaims"},
 		"",
 		errors.New("no RBAC"),
 	))).To(BeFalse(), "Forbidden is a real misconfiguration and should retry")
+}
+
+func TestCleanupAction_DeletesCredentialsSecret(t *testing.T) {
+	g := NewWithT(t)
+	claim, provider, adminSecret := cleanupFixtures()
+	credSecret := ownedCredentialsSecret(t, claim)
+	cli := fakeCleanupClient(t, provider, adminSecret, claim, credSecret)
+
+	err := newCleanupController(&cleanupPG{databases: map[string]bool{"analytics": true}}).cleanupAction(
+		context.Background(),
+		claimTestRequest(t, cli, claim),
+	)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &corev1.Secret{}
+	err = cli.Get(context.Background(), client.ObjectKeyFromObject(credSecret), got)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(client.IgnoreNotFound(err)).To(Succeed())
+}
+
+func TestCleanupAction_EmptyProviderStillDeletesCredentialsSecret(t *testing.T) {
+	g := NewWithT(t)
+	claim, _, _ := cleanupFixtures()
+	claim.Status.Provider = ""
+	credSecret := ownedCredentialsSecret(t, claim)
+	cli := fakeCleanupClient(t, claim, credSecret)
+
+	err := newCleanupController(&cleanupPG{}).cleanupAction(
+		context.Background(),
+		claimTestRequest(t, cli, claim),
+	)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &corev1.Secret{}
+	err = cli.Get(context.Background(), client.ObjectKeyFromObject(credSecret), got)
+	g.Expect(client.IgnoreNotFound(err)).To(Succeed())
+}
+
+func TestCleanupAction_SkipsCredentialsSecretOwnedByOtherClaim(t *testing.T) {
+	g := NewWithT(t)
+	claim, provider, adminSecret := cleanupFixtures()
+	controller := true
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      dbcontroller.SecretNameForDatabaseClaim(claim),
+			Namespace: claim.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: infraApi.GroupVersion.String(),
+				Kind:       infraApi.SchemaClaimKind,
+				Name:       "foo",
+				UID:        types.UID("other-claim-uid"),
+				Controller: &controller,
+			}},
+		},
+	}
+	cli := fakeCleanupClient(t, provider, adminSecret, claim, credSecret)
+
+	err := newCleanupController(&cleanupPG{databases: map[string]bool{"analytics": true}}).cleanupAction(
+		context.Background(),
+		claimTestRequest(t, cli, claim),
+	)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	got := &corev1.Secret{}
+	g.Expect(cli.Get(context.Background(), client.ObjectKeyFromObject(credSecret), got)).To(Succeed())
 }
 
 type extensionProvisionPG struct {
@@ -208,19 +279,40 @@ func (p *extensionProvisionPG) QueryRow(_ context.Context, query string, args ..
 	if p.databases == nil {
 		p.databases = map[string]bool{}
 	}
-	name, _ := args[0].(string)
 	switch {
 	case strings.Contains(query, "pg_database"):
+		name, _ := args[0].(string)
 		return extensionBoolRow{p.databases[name]}, nil
-	case strings.Contains(query, "pg_available_extensions"):
-		avail := false
-		if p.extensionAvailable != nil {
-			avail = p.extensionAvailable[name]
+	case strings.Contains(query, "pg_extension"):
+		if names, ok := args[0].([]string); ok {
+			var installed []string
+			for _, name := range names {
+				if p.extensionAvailable[name] {
+					installed = append(installed, name)
+				}
+			}
+			return extensionNamesRow{names: installed}, nil
 		}
-		return extensionBoolRow{avail}, nil
+		name, _ := args[0].(string)
+		installed := false
+		if p.extensionAvailable != nil {
+			installed = p.extensionAvailable[name]
+		}
+		return extensionBoolRow{installed}, nil
 	default:
 		return extensionBoolRow{false}, nil
 	}
+}
+
+type extensionNamesRow struct{ names []string }
+
+func (r extensionNamesRow) Scan(dest ...any) error {
+	ptr, ok := dest[0].(*[]string)
+	if !ok {
+		return fmt.Errorf("expected *[]string")
+	}
+	*ptr = append([]string(nil), r.names...)
+	return nil
 }
 
 func (p *extensionProvisionPG) execSQLsContainingCreateExtension() bool {
@@ -267,4 +359,133 @@ func claimTestRequest(t *testing.T, cli client.Client, claim *infraApi.DatabaseC
 		Conditions: conditions.NewManager(claim, aggregator),
 		Instance:   claim,
 	}
+}
+
+func newCleanupController(pg *cleanupPG) *Controller {
+	return &Controller{Options: Options{
+		cfg: &moduleconfig.Config{OperatorNamespace: "odh-db-operator-system"},
+		PostgresClientFactory: func(_ context.Context, _ postgres.Config) (postgres.Client, error) {
+			return pg, nil
+		},
+	}}
+}
+
+func cleanupFixtures() (*infraApi.DatabaseClaim, *infraApi.DatabaseProvider, *corev1.Secret) {
+	provider := &infraApi.DatabaseProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "rhai-db"},
+		Spec: infraApi.DatabaseProviderSpec{
+			Type:     infraApi.ProviderTypeInternal,
+			Internal: &infraApi.InternalProviderSpec{Namespace: "database-system"},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      dbcontroller.InternalAdminSecretName(provider.Name),
+			Namespace: "database-system",
+		},
+		Data: map[string][]byte{
+			postgres.SecretKeyHost:     []byte("rhai-db.database-system.svc"),
+			postgres.SecretKeyPort:     []byte("5432"),
+			postgres.SecretKeyUser:     []byte("postgres"),
+			postgres.SecretKeyPassword: []byte("postgres"),
+			postgres.SecretKeyDatabase: []byte("postgres"),
+		},
+	}
+	claim := &infraApi.DatabaseClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "analytics",
+			Namespace: "app",
+			UID:       types.UID("database-claim-uid"),
+		},
+		Spec: infraApi.DatabaseClaimSpec{
+			Provider:       infraApi.ProviderRef{Name: "rhai-db"},
+			Database:       "analytics",
+			DeletionPolicy: infraApi.DeletionPolicyRetain,
+		},
+		Status: infraApi.DatabaseClaimStatus{
+			Provider: "rhai-db",
+			Database: "analytics",
+			Connection: infraApi.DatabaseConnectionStatus{
+				Database: "analytics",
+			},
+		},
+	}
+	return claim, provider, secret
+}
+
+func ownedCredentialsSecret(t *testing.T, claim *infraApi.DatabaseClaim) *corev1.Secret {
+	t.Helper()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      dbcontroller.SecretNameForDatabaseClaim(claim),
+			Namespace: claim.Namespace,
+		},
+	}
+	g := NewWithT(t)
+	g.Expect(controllerutil.SetControllerReference(claim, secret, claimTestScheme(t))).To(Succeed())
+	return secret
+}
+
+func fakeCleanupClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().WithScheme(claimTestScheme(t)).WithObjects(objs...).Build()
+}
+
+// cleanupPG is a minimal postgres.Client fake for cleanupAction paths.
+type cleanupPG struct {
+	databases    map[string]bool
+	roles        map[string]bool
+	droppedRoles []string
+}
+
+func (t *cleanupPG) Config() postgres.Config { return postgres.Config{} }
+func (t *cleanupPG) Close()                  {}
+func (t *cleanupPG) Ping(context.Context) error {
+	return nil
+}
+
+func (t *cleanupPG) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(query, "DROP ROLE") {
+		start := strings.Index(query, `"`)
+		end := strings.LastIndex(query, `"`)
+		if start >= 0 && end > start {
+			name := query[start+1 : end]
+			delete(t.roles, name)
+			t.droppedRoles = append(t.droppedRoles, name)
+		}
+	}
+	return pgconn.CommandTag{}, nil
+}
+
+func (t *cleanupPG) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, fmt.Errorf("unexpected Query")
+}
+
+func (t *cleanupPG) QueryRow(_ context.Context, query string, args ...any) (pgx.Row, error) {
+	if t.databases == nil {
+		t.databases = map[string]bool{}
+	}
+	if t.roles == nil {
+		t.roles = map[string]bool{}
+	}
+	name, _ := args[0].(string)
+	switch {
+	case strings.Contains(query, "pg_database"):
+		return cleanupBoolRow{t.databases[name]}, nil
+	case strings.Contains(query, "pg_roles"):
+		return cleanupBoolRow{t.roles[name]}, nil
+	default:
+		return cleanupBoolRow{false}, nil
+	}
+}
+
+type cleanupBoolRow struct{ v bool }
+
+func (r cleanupBoolRow) Scan(dest ...any) error {
+	ptr, ok := dest[0].(*bool)
+	if !ok {
+		return fmt.Errorf("expected *bool")
+	}
+	*ptr = r.v
+	return nil
 }

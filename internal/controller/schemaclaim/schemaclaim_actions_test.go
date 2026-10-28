@@ -148,6 +148,7 @@ func TestProvisionAction_ExtensionNotAvailable(t *testing.T) {
 	g.Expect(err).To(HaveOccurred())
 	var stop odherrors.StopError
 	g.Expect(errors.As(err, &stop)).To(BeTrue())
+	g.Expect(stop.RequeueAfter()).To(Equal(moduleconfig.DefaultRetryInterval))
 	var missingExt claimerrors.ExtensionNotAvailable
 	g.Expect(errors.As(err, &missingExt)).To(BeTrue())
 
@@ -542,19 +543,40 @@ func (p *extensionProvisionPG) QueryRow(_ context.Context, query string, args ..
 	if p.databases == nil {
 		p.databases = map[string]bool{}
 	}
-	name, _ := args[0].(string)
 	switch {
 	case strings.Contains(query, "pg_database"):
+		name, _ := args[0].(string)
 		return cleanupBoolRow{p.databases[name]}, nil
-	case strings.Contains(query, "pg_available_extensions"):
-		avail := false
-		if p.extensionAvailable != nil {
-			avail = p.extensionAvailable[name]
+	case strings.Contains(query, "pg_extension"):
+		if names, ok := args[0].([]string); ok {
+			var installed []string
+			for _, name := range names {
+				if p.extensionAvailable[name] {
+					installed = append(installed, name)
+				}
+			}
+			return extensionNamesRow{names: installed}, nil
 		}
-		return cleanupBoolRow{avail}, nil
+		name, _ := args[0].(string)
+		installed := false
+		if p.extensionAvailable != nil {
+			installed = p.extensionAvailable[name]
+		}
+		return cleanupBoolRow{installed}, nil
 	default:
 		return cleanupBoolRow{false}, nil
 	}
+}
+
+type extensionNamesRow struct{ names []string }
+
+func (r extensionNamesRow) Scan(dest ...any) error {
+	ptr, ok := dest[0].(*[]string)
+	if !ok {
+		return fmt.Errorf("expected *[]string")
+	}
+	*ptr = append([]string(nil), r.names...)
+	return nil
 }
 
 func (p *extensionProvisionPG) execSQLsContainingCreateExtension() bool {

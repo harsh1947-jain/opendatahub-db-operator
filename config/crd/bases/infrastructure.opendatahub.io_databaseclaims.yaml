@@ -94,6 +94,7 @@ spec:
                 items:
                   enum:
                   - vector
+                  maxLength: 63
                   type: string
                 type: array
                 x-kubernetes-list-type: atomic

@@ -77,29 +77,38 @@ func (p DatabaseProvisioner) Ensure(ctx context.Context) (*corev1.Secret, error)
 		p.Claim.Status.DatabaseCreated = true
 	}
 
-	dbCfg := p.ProviderConfig
-	dbCfg.DBName = database
-	dbClient, err := dbcontroller.OpenClient(ctx, dbCfg, p.ClientFactory)
-	if err != nil {
-		return nil, dbcontroller.WrapQuickRetry("opening database client", err)
+	// Reject a colliding credentials Secret before role/extension work.
+	// SchemaClaim "foo" and DatabaseClaim "sc-foo" both default to Secret "sc-foo".
+	secret := &corev1.Secret{}
+	secret.Name = dbcontroller.SecretNameForDatabaseClaim(p.Claim)
+	secret.Namespace = p.Claim.Namespace
+	if err := p.Client.Get(ctx, client.ObjectKeyFromObject(secret), secret); client.IgnoreNotFound(err) != nil {
+		return nil, fmt.Errorf("checking credentials Secret existence: %w", err)
 	}
-	defer dbClient.Close()
+	if err := dbcontroller.RejectForeignCredentialsSecret(secret, p.Claim.UID); err != nil {
+		return nil, err
+	}
 
-	if err := dbcontroller.EnsureClaimExtensions(ctx, dbClient, p.Provider, p.Claim.Spec.Extensions); err != nil {
-		return nil, dbcontroller.WrapQuickRetry("ensuring claim extensions", err)
+	// Extensions are per-database; only dial the target DB when required so
+	// the common empty-extensions path keeps using the admin connection only.
+	if len(p.Claim.Spec.Extensions) > 0 {
+		dbCfg := p.ProviderConfig
+		dbCfg.DBName = database
+		dbClient, err := dbcontroller.OpenClient(ctx, dbCfg, p.ClientFactory)
+		if err != nil {
+			return nil, dbcontroller.WrapQuickRetry("opening database client", err)
+		}
+		defer dbClient.Close()
+
+		if err := dbcontroller.EnsureClaimExtensions(ctx, dbClient, p.Provider, p.Claim.Spec.Extensions); err != nil {
+			return nil, dbcontroller.WrapQuickRetry("ensuring claim extensions", err)
+		}
 	}
 
 	role := dbcontroller.RoleNameFor(p.Claim.Namespace, p.Claim.Name)
 	roleExists, err := postgres.RoleExists(ctx, p.Postgres, role)
 	if err != nil {
 		return nil, dbcontroller.WrapQuickRetry("checking role existence", err)
-	}
-
-	secret := &corev1.Secret{}
-	secret.Name = dbcontroller.SecretNameForDatabaseClaim(p.Claim)
-	secret.Namespace = p.Claim.Namespace
-	if err := p.Client.Get(ctx, client.ObjectKeyFromObject(secret), secret); client.IgnoreNotFound(err) != nil {
-		return nil, fmt.Errorf("checking credentials Secret existence: %w", err)
 	}
 
 	secretExists := secret.ResourceVersion != ""

@@ -157,8 +157,9 @@ func ExternalProviderAllows(
 }
 
 // EnsureClaimExtensions installs claim-required extensions on Internal
-// providers and verifies them against pg_available_extensions on External
-// (and any non-Internal) providers. External paths never issue CREATE EXTENSION.
+// providers and verifies them against pg_extension in the connected database
+// on External (and any non-Internal) providers. External paths never issue
+// CREATE EXTENSION.
 func EnsureClaimExtensions(
 	ctx context.Context,
 	cli postgres.Client,

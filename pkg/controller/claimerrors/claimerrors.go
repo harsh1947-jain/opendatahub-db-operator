@@ -80,8 +80,9 @@ func (e SecretNotOwned) Error() string {
 }
 
 // ExtensionNotAvailable is returned when a claim requires PostgreSQL
-// extensions that are absent from pg_available_extensions on an External
-// provider. The claim must not bind until an administrator installs them.
+// extensions that are absent from pg_extension in the target database on an
+// External provider. The claim must not bind until an administrator installs
+// them in that database.
 type ExtensionNotAvailable struct {
 	Extensions []string
 }
@@ -89,12 +90,12 @@ type ExtensionNotAvailable struct {
 func (e ExtensionNotAvailable) Error() string {
 	switch len(e.Extensions) {
 	case 0:
-		return "required extensions are not available on the provider"
+		return "required extensions are not installed in the target database"
 	case 1:
-		return fmt.Sprintf("extension %q is not available on the provider", e.Extensions[0])
+		return fmt.Sprintf("extension %q is not installed in the target database", e.Extensions[0])
 	default:
 		return fmt.Sprintf(
-			"extensions [%s] are not available on the provider",
+			"extensions [%s] are not installed in the target database",
 			strings.Join(e.Extensions, ", "),
 		)
 	}

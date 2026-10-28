@@ -113,6 +113,7 @@ type SchemaClaimSpec struct {
 	//
 	// +optional
 	// +listType=atomic
+	// +kubebuilder:validation:items:MaxLength=63
 	// +kubebuilder:validation:items:Enum=vector
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="extensions are immutable once set"
 	Extensions []string `json:"extensions,omitempty"`

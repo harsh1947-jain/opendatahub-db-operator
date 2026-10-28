@@ -98,7 +98,7 @@ func (stubClient) QueryRow(context.Context, string, ...any) (pgx.Row, error) {
 
 func TestEnsureClaimExtensions_EmptyNoop(t *testing.T) {
 	g := NewWithT(t)
-	cli := &recordingClient{availableByName: map[string]bool{"vector": true}}
+	cli := &recordingClient{installedByName: map[string]bool{"vector": true}}
 	provider := &infraApi.DatabaseProvider{
 		Spec: infraApi.DatabaseProviderSpec{Type: infraApi.ProviderTypeInternal},
 	}
@@ -118,9 +118,9 @@ func TestEnsureClaimExtensions_InternalInstalls(t *testing.T) {
 	g.Expect(cli.execSQLs[0]).To(ContainSubstring("vector"))
 }
 
-func TestEnsureClaimExtensions_ExternalAvailableNoCreate(t *testing.T) {
+func TestEnsureClaimExtensions_ExternalInstalledNoCreate(t *testing.T) {
 	g := NewWithT(t)
-	cli := &recordingClient{availableByName: map[string]bool{"vector": true}}
+	cli := &recordingClient{installedByName: map[string]bool{"vector": true}}
 	provider := &infraApi.DatabaseProvider{
 		Spec: infraApi.DatabaseProviderSpec{Type: infraApi.ProviderTypeExternal},
 	}
@@ -133,7 +133,7 @@ func TestEnsureClaimExtensions_ExternalAvailableNoCreate(t *testing.T) {
 
 func TestEnsureClaimExtensions_ExternalMissingNamedError(t *testing.T) {
 	g := NewWithT(t)
-	cli := &recordingClient{availableByName: map[string]bool{"vector": false}}
+	cli := &recordingClient{installedByName: map[string]bool{"vector": false}}
 	provider := &infraApi.DatabaseProvider{
 		Spec: infraApi.DatabaseProviderSpec{Type: infraApi.ProviderTypeExternal},
 	}
@@ -149,7 +149,7 @@ func TestEnsureClaimExtensions_ExternalMissingNamedError(t *testing.T) {
 
 func TestEnsureClaimExtensions_ExternalMultipleMissingReportedTogether(t *testing.T) {
 	g := NewWithT(t)
-	cli := &recordingClient{availableByName: map[string]bool{"vector": false, "postgis": false}}
+	cli := &recordingClient{installedByName: map[string]bool{"vector": false, "postgis": false}}
 	provider := &infraApi.DatabaseProvider{
 		Spec: infraApi.DatabaseProviderSpec{Type: infraApi.ProviderTypeExternal},
 	}
@@ -168,7 +168,7 @@ func TestEnsureClaimExtensions_NilProviderRejected(t *testing.T) {
 }
 
 type recordingClient struct {
-	availableByName map[string]bool
+	installedByName map[string]bool
 	execSQLs        []string
 }
 
@@ -185,17 +185,28 @@ func (c *recordingClient) Query(context.Context, string, ...any) (pgx.Rows, erro
 	return nil, nil
 }
 func (c *recordingClient) QueryRow(_ context.Context, _ string, args ...any) (pgx.Row, error) {
-	available := false
-	if c.availableByName != nil && len(args) > 0 {
-		if name, ok := args[0].(string); ok {
-			available = c.availableByName[name]
+	if len(args) > 0 {
+		if names, ok := args[0].([]string); ok {
+			var installed []string
+			for _, name := range names {
+				if c.installedByName[name] {
+					installed = append(installed, name)
+				}
+			}
+			return recordingNamesRow{names: installed}, nil
 		}
 	}
-	return recordingBoolRow{available: available}, nil
+	installed := false
+	if c.installedByName != nil && len(args) > 0 {
+		if name, ok := args[0].(string); ok {
+			installed = c.installedByName[name]
+		}
+	}
+	return recordingBoolRow{installed: installed}, nil
 }
 
 type recordingBoolRow struct {
-	available bool
+	installed bool
 }
 
 func (r recordingBoolRow) Scan(dest ...any) error {
@@ -206,6 +217,22 @@ func (r recordingBoolRow) Scan(dest ...any) error {
 	if !ok {
 		return errors.New("expected *bool scan destination")
 	}
-	*ptr = r.available
+	*ptr = r.installed
+	return nil
+}
+
+type recordingNamesRow struct {
+	names []string
+}
+
+func (r recordingNamesRow) Scan(dest ...any) error {
+	if len(dest) != 1 {
+		return errors.New("expected one scan destination")
+	}
+	ptr, ok := dest[0].(*[]string)
+	if !ok {
+		return errors.New("expected *[]string scan destination")
+	}
+	*ptr = append([]string(nil), r.names...)
 	return nil
 }

@@ -375,6 +375,48 @@ func TestEnsure_ReadOnlyGrantsConnectWithoutDatabaseCreate(t *testing.T) {
 	g.Expect(pg.grantedDBCreate).To(Equal(0))
 }
 
+// TestEnsure_RegrantsSchemaPrivilegesOnEveryReconcile guards the partial-grant
+// self-heal path: GrantSchemaPrivileges is multi-statement, and a shallow
+// USAGE/CREATE check must not skip re-grant on later reconciles.
+func TestEnsure_RegrantsSchemaPrivilegesOnEveryReconcile(t *testing.T) {
+	g := NewWithT(t)
+	claim := sampleClaim()
+	pg := &trackingClient{
+		cfg:       providerConfig(),
+		databases: map[string]bool{"analytics": true},
+	}
+	cli := fakeClient(t, claim)
+	provisioner := schemaclaim.SchemaProvisioner{
+		Client:         cli,
+		Claim:          claim,
+		Provider:       internalProvider(),
+		Postgres:       pg,
+		ProviderConfig: providerConfig(),
+		ClientFactory: func(_ context.Context, cfg postgres.Config) (postgres.Client, error) {
+			return &trackingClient{
+				cfg:          cfg,
+				databases:    pg.databases,
+				schemas:      pg.schemas,
+				schemaOwners: pg.schemaOwners,
+				roles:        pg.roles,
+				parent:       pg,
+			}, nil
+		},
+	}
+
+	_, err := provisioner.Ensure(context.Background())
+	g.Expect(err).NotTo(HaveOccurred())
+	afterFirstTables := pg.countExecContaining("ON ALL TABLES IN SCHEMA")
+	afterFirstDefaults := pg.countExecContaining("ALTER DEFAULT PRIVILEGES IN SCHEMA")
+	g.Expect(afterFirstTables).To(BeNumerically(">", 0))
+	g.Expect(afterFirstDefaults).To(BeNumerically(">", 0))
+
+	_, err = provisioner.Ensure(context.Background())
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(pg.countExecContaining("ON ALL TABLES IN SCHEMA")).To(Equal(afterFirstTables * 2))
+	g.Expect(pg.countExecContaining("ALTER DEFAULT PRIVILEGES IN SCHEMA")).To(Equal(afterFirstDefaults * 2))
+}
+
 func TestEnsure_InternalInstallsExtensionsBeforeSchema(t *testing.T) {
 	g := NewWithT(t)
 	claim := sampleClaim()
@@ -602,6 +644,17 @@ func (t *trackingClient) execSQLsContainingCreateExtension(name string) bool {
 	return false
 }
 
+func (t *trackingClient) countExecContaining(substr string) int {
+	root := t.root()
+	n := 0
+	for _, stmt := range root.execSQLs {
+		if strings.Contains(stmt, substr) {
+			n++
+		}
+	}
+	return n
+}
+
 func (t *trackingClient) root() *trackingClient {
 	if t.parent != nil {
 		return t.parent
@@ -694,13 +747,22 @@ func (t *trackingClient) QueryRow(_ context.Context, query string, args ...any) 
 		return boolRow{root.roles[name]}, nil
 	case strings.Contains(query, "HAS_DATABASE_PRIVILEGE"), strings.Contains(query, "HAS_SCHEMA_PRIVILEGE"):
 		return boolRow{false}, nil
-	case strings.Contains(query, "pg_available_extensions"):
-		name, _ := args[0].(string)
-		avail := false
-		if root.extensionAvailableByName != nil {
-			avail = root.extensionAvailableByName[name]
+	case strings.Contains(query, "pg_extension"):
+		if names, ok := args[0].([]string); ok {
+			var installed []string
+			for _, name := range names {
+				if root.extensionAvailableByName[name] {
+					installed = append(installed, name)
+				}
+			}
+			return namesRow{names: installed}, nil
 		}
-		return boolRow{avail}, nil
+		name, _ := args[0].(string)
+		installed := false
+		if root.extensionAvailableByName != nil {
+			installed = root.extensionAvailableByName[name]
+		}
+		return boolRow{installed}, nil
 	default:
 		return boolRow{false}, nil
 	}
@@ -717,6 +779,17 @@ func (r boolRow) Scan(dest ...any) error {
 		return fmt.Errorf("expected *bool")
 	}
 	*ptr = r.v
+	return nil
+}
+
+type namesRow struct{ names []string }
+
+func (r namesRow) Scan(dest ...any) error {
+	ptr, ok := dest[0].(*[]string)
+	if !ok {
+		return fmt.Errorf("expected *[]string")
+	}
+	*ptr = append([]string(nil), r.names...)
 	return nil
 }
 

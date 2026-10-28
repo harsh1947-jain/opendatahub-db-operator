@@ -154,8 +154,8 @@ func (m *Controller) provisionAction(ctx context.Context, rr *odhtypes.Reconcili
 		rr.Conditions.Mark(ConditionProvisioned, metav1.ConditionFalse,
 			conditions.WithReason("ExtensionNotAvailable"),
 			conditions.WithMessage(missingExt.Error()))
-		// Terminal: admin must install the extension or change the claim.
-		return odherrors.NewStopErrorW(missingExt)
+		// Out-of-band install in the target DB; requeue like DatabaseNotFound.
+		return odherrors.NewStopErrorW(missingExt).WithRequeueAfter(m.retryInterval())
 	}
 	if err != nil {
 		rr.Conditions.Mark(ConditionProvisioned, metav1.ConditionFalse,

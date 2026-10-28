@@ -170,13 +170,11 @@ func (p SchemaProvisioner) Ensure(ctx context.Context) (*corev1.Secret, error) {
 		}
 	}
 
-	switch ok, err := postgres.HasSchemaPrivileges(ctx, dbClient, schema, role, access); {
-	case err != nil:
-		return nil, dbcontroller.WrapQuickRetry("checking schema privileges", err)
-	case !ok:
-		if err := postgres.GrantSchemaPrivileges(ctx, dbClient, schema, role, access); err != nil {
-			return nil, dbcontroller.WrapQuickRetry("granting schema privileges", err)
-		}
+	// Always re-grant: GrantSchemaPrivileges is multi-statement and idempotent.
+	// HasSchemaPrivileges only checks schema USAGE/CREATE, so a partial grant
+	// (USAGE present, table/default privileges missing) would otherwise stick.
+	if err := postgres.GrantSchemaPrivileges(ctx, dbClient, schema, role, access); err != nil {
+		return nil, dbcontroller.WrapQuickRetry("granting schema privileges", err)
 	}
 	secret.SetGroupVersionKind(gvk.Secret)
 

@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	infraApi "github.com/opendatahub-io/opendatahub-db-operator/api/infrastructure/v1alpha1"
 	"github.com/opendatahub-io/opendatahub-db-operator/internal/controller/databaseclaim"
@@ -168,18 +169,17 @@ func TestEnsure_RotatesPasswordWhenSecretMissingButRoleExists(t *testing.T) {
 func TestEnsure_RotatesPasswordWhenSecretPasswordEmpty(t *testing.T) {
 	g := NewWithT(t)
 	claim := sampleClaim("analytics")
+	claim.UID = "claim-a-uid"
 	role := dbcontroller.RoleNameFor(claim.Namespace, claim.Name)
 	pg := &trackingClient{
 		cfg:       providerConfig(),
 		databases: map[string]bool{"analytics": true},
 		roles:     map[string]bool{role: true},
 	}
-	existing := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: claim.Name, Namespace: claim.Namespace},
-		Data: map[string][]byte{
-			postgres.SecretKeyHost:     []byte("stale.example"),
-			postgres.SecretKeyPassword: []byte(""),
-		},
+	existing := credentialsSecretOwnedBy(t, claim.Name, claim.Namespace, claim)
+	existing.Data = map[string][]byte{
+		postgres.SecretKeyHost:     []byte("stale.example"),
+		postgres.SecretKeyPassword: []byte(""),
 	}
 
 	secret, err := databaseclaim.DatabaseProvisioner{
@@ -273,6 +273,73 @@ func TestEnsure_ReadOnlyGrantsConnectWithoutCreate(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(pg.grantedConnect).To(Equal(1))
 	g.Expect(pg.grantedCreate).To(Equal(0))
+}
+
+func TestEnsure_RejectsCredentialsSecretOwnedByOther(t *testing.T) {
+	g := NewWithT(t)
+	claim := sampleClaim("analytics")
+	claim.Name = "sc-foo"
+	claim.UID = "databaseclaim-uid"
+	foreignOwner := &infraApi.SchemaClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo",
+			Namespace: claim.Namespace,
+			UID:       "schemaclaim-uid",
+		},
+	}
+	secretName := dbcontroller.SecretNameForDatabaseClaim(claim)
+	g.Expect(secretName).To(Equal("sc-foo"))
+	g.Expect(dbcontroller.SecretNameForSchemaClaim(foreignOwner)).To(Equal(secretName))
+	foreignSecret := credentialsSecretOwnedBy(t, secretName, claim.Namespace, foreignOwner)
+	originalUser := []byte("schema-role")
+	foreignSecret.Data = map[string][]byte{postgres.SecretKeyUser: originalUser}
+	pg := &trackingClient{
+		cfg:       providerConfig(),
+		databases: map[string]bool{"analytics": true},
+	}
+	cli := fakeClient(t, foreignSecret)
+
+	_, err := databaseclaim.DatabaseProvisioner{
+		Client:         cli,
+		Claim:          claim,
+		Provider:       internalProvider(),
+		Postgres:       pg,
+		ProviderConfig: providerConfig(),
+		ClientFactory:  testDBClientFactory(pg),
+	}.Ensure(context.Background())
+
+	g.Expect(err).To(MatchError(claimerrors.SecretNotOwned{Secret: secretName}))
+	g.Expect(pg.createdRoles).To(BeEmpty())
+	stored := &corev1.Secret{}
+	g.Expect(cli.Get(context.Background(), client.ObjectKeyFromObject(foreignSecret), stored)).To(Succeed())
+	g.Expect(stored.Data[postgres.SecretKeyUser]).To(Equal(originalUser))
+}
+
+func TestEnsure_EmptyExtensionsSkipsTargetDatabaseClient(t *testing.T) {
+	g := NewWithT(t)
+	claim := sampleClaim("analytics")
+	pg := &trackingClient{
+		cfg:       providerConfig(),
+		databases: map[string]bool{"analytics": true},
+	}
+	factoryCalls := 0
+	factory := func(ctx context.Context, cfg postgres.Config) (postgres.Client, error) {
+		factoryCalls++
+		return testDBClientFactory(pg)(ctx, cfg)
+	}
+
+	_, err := databaseclaim.DatabaseProvisioner{
+		Client:         fakeClient(t),
+		Claim:          claim,
+		Provider:       internalProvider(),
+		Postgres:       pg,
+		ProviderConfig: providerConfig(),
+		ClientFactory:  factory,
+	}.Ensure(context.Background())
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(factoryCalls).To(Equal(0))
+	g.Expect(pg.createdRoles).NotTo(BeEmpty())
 }
 
 func TestEnsure_InternalInstallsExtensionsBeforeRole(t *testing.T) {
@@ -409,6 +476,24 @@ func fakeClient(t *testing.T, objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
 
+func credentialsSecretOwnedBy(t *testing.T, name, namespace string, owner metav1.Object) *corev1.Secret {
+	t.Helper()
+	g := NewWithT(t)
+	scheme := runtime.NewScheme()
+	g.Expect(infraApi.AddToScheme(scheme)).To(Succeed())
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+	}
+	ownerObj, ok := owner.(client.Object)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(controllerutil.SetControllerReference(ownerObj, secret, scheme)).To(Succeed())
+	return secret
+}
+
 type trackingClient struct {
 	cfg                      postgres.Config
 	databases                map[string]bool
@@ -496,13 +581,22 @@ func (t *trackingClient) QueryRow(_ context.Context, sql string, args ...any) (p
 		return boolRow{root.roles[name]}, nil
 	case strings.Contains(sql, "HAS_DATABASE_PRIVILEGE"):
 		return boolRow{false}, nil
-	case strings.Contains(sql, "pg_available_extensions"):
-		name, _ := args[0].(string)
-		avail := false
-		if root.extensionAvailableByName != nil {
-			avail = root.extensionAvailableByName[name]
+	case strings.Contains(sql, "pg_extension"):
+		if names, ok := args[0].([]string); ok {
+			var installed []string
+			for _, name := range names {
+				if root.extensionAvailableByName[name] {
+					installed = append(installed, name)
+				}
+			}
+			return namesRow{names: installed}, nil
 		}
-		return boolRow{avail}, nil
+		name, _ := args[0].(string)
+		installed := false
+		if root.extensionAvailableByName != nil {
+			installed = root.extensionAvailableByName[name]
+		}
+		return boolRow{installed}, nil
 	default:
 		return boolRow{false}, nil
 	}
@@ -519,6 +613,17 @@ func (r boolRow) Scan(dest ...any) error {
 		return fmt.Errorf("expected *bool")
 	}
 	*ptr = r.v
+	return nil
+}
+
+type namesRow struct{ names []string }
+
+func (r namesRow) Scan(dest ...any) error {
+	ptr, ok := dest[0].(*[]string)
+	if !ok {
+		return fmt.Errorf("expected *[]string")
+	}
+	*ptr = append([]string(nil), r.names...)
 	return nil
 }
 
