@@ -39,6 +39,7 @@ import (
 	"github.com/opendatahub-io/opendatahub-db-operator/internal/controller/databaseprovider"
 	"github.com/opendatahub-io/opendatahub-db-operator/internal/controller/databaseservice"
 	"github.com/opendatahub-io/opendatahub-db-operator/internal/controller/schemaclaim"
+	modulewebhook "github.com/opendatahub-io/opendatahub-db-operator/internal/webhook"
 	moduleconfig "github.com/opendatahub-io/opendatahub-db-operator/pkg/config"
 )
 
@@ -175,6 +176,12 @@ func New(
 		}
 	} else {
 		log.Info("SchemaClaim reconciliation skipped; requires claim and provider CRDs (restart after install)")
+	}
+
+	if cfg.Controller.Webhook.Enabled {
+		if err := modulewebhook.SetupClaimExtensions(mgr, databaseClaimCRDAvailable, schemaClaimCRDAvailable); err != nil {
+			return nil, fmt.Errorf("registering claim extensions webhooks: %w", err)
+		}
 	}
 
 	if err := mgr.AddHealthzCheck(healthCheckName, healthz.Ping); err != nil {

@@ -156,10 +156,39 @@ func ExternalProviderAllows(
 	return slices.Contains(provider.Spec.External.Capabilities, capability)
 }
 
+// SupportedClaimExtensions is the platform allow-list for claim
+// spec.extensions . Admission and EnsureClaimExtensions share
+// this declaration. Keep it aligned with the claim CRD Enum markers.
+var SupportedClaimExtensions = []string{"vector"}
+
+// ValidateClaimExtensions rejects extension names outside
+// SupportedClaimExtensions. Empty or nil input is allowed. Unsupported names
+// are reported in input order via claimerrors.ExtensionNotSupported.
+func ValidateClaimExtensions(extensions []string) error {
+	if len(extensions) == 0 {
+		return nil
+	}
+	supported := make(map[string]struct{}, len(SupportedClaimExtensions))
+	for _, name := range SupportedClaimExtensions {
+		supported[name] = struct{}{}
+	}
+	var unsupported []string
+	for _, name := range extensions {
+		if _, ok := supported[name]; !ok {
+			unsupported = append(unsupported, name)
+		}
+	}
+	if len(unsupported) == 0 {
+		return nil
+	}
+	return claimerrors.ExtensionNotSupported{Extensions: unsupported}
+}
+
 // EnsureClaimExtensions installs claim-required extensions on Internal
 // providers and verifies them against pg_extension in the connected database
 // on External (and any non-Internal) providers. External paths never issue
-// CREATE EXTENSION.
+// CREATE EXTENSION. Names are validated against SupportedClaimExtensions
+// before any PostgreSQL I/O.
 func EnsureClaimExtensions(
 	ctx context.Context,
 	cli postgres.Client,
@@ -168,6 +197,9 @@ func EnsureClaimExtensions(
 ) error {
 	if len(extensions) == 0 {
 		return nil
+	}
+	if err := ValidateClaimExtensions(extensions); err != nil {
+		return err
 	}
 	if provider == nil {
 		return fmt.Errorf("provider is required for extension verification")

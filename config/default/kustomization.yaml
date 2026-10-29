@@ -36,6 +36,11 @@ replacements:
     options:
       delimiter: '.'
       index: 0
+  - select:
+      kind: ValidatingWebhookConfiguration
+    fieldPaths:
+    - .webhooks.0.clientConfig.service.name
+    - .webhooks.1.clientConfig.service.name
 - source:
     kind: Service
     version: v1
@@ -53,6 +58,11 @@ replacements:
     options:
       delimiter: '.'
       index: 1
+  - select:
+      kind: ValidatingWebhookConfiguration
+    fieldPaths:
+    - .webhooks.0.clientConfig.service.namespace
+    - .webhooks.1.clientConfig.service.namespace
 - source:
     kind: Issuer
     group: cert-manager.io
@@ -67,3 +77,33 @@ replacements:
       name: serving-cert
     fieldPaths:
     - .spec.issuerRef.name
+- source:
+    kind: Certificate
+    group: cert-manager.io
+    version: v1
+    name: serving-cert
+    fieldPath: .metadata.namespace
+  targets:
+  - select:
+      kind: ValidatingWebhookConfiguration
+    fieldPaths:
+    - .metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 0
+      create: true
+- source:
+    kind: Certificate
+    group: cert-manager.io
+    version: v1
+    name: serving-cert
+    fieldPath: .metadata.name
+  targets:
+  - select:
+      kind: ValidatingWebhookConfiguration
+    fieldPaths:
+    - .metadata.annotations.[cert-manager.io/inject-ca-from]
+    options:
+      delimiter: '/'
+      index: 1
+      create: true

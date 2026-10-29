@@ -17,6 +17,7 @@ limitations under the License.
 package webhookserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -36,7 +37,7 @@ import (
 	modulemanager "github.com/opendatahub-io/opendatahub-db-operator/pkg/manager"
 )
 
-func TestManagerStartsWebhookServerWithoutAdmissionHandlers(t *testing.T) {
+func TestManagerStartsWebhookServerWithClaimExtensionHandlers(t *testing.T) {
 	g := NewWithT(t)
 	ctrl.SetLogger(logr.Discard())
 
@@ -96,9 +97,10 @@ func TestManagerStartsWebhookServerWithoutAdmissionHandlers(t *testing.T) {
 		},
 	}
 	t.Cleanup(webhookClient.CloseIdleConnections)
-	webhookURL := fmt.Sprintf("https://127.0.0.1:%d/", cfg.Controller.Webhook.Port)
+
+	rootURL := fmt.Sprintf("https://127.0.0.1:%d/", cfg.Controller.Webhook.Port)
 	g.Eventually(func() error {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, webhookURL, nil)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, rootURL, nil)
 		if err != nil {
 			return err
 		}
@@ -118,7 +120,32 @@ func TestManagerStartsWebhookServerWithoutAdmissionHandlers(t *testing.T) {
 		}
 		return nil
 	}).WithTimeout(30*time.Second).Should(Succeed(),
-		"the TLS webhook listener should be reachable while no handler is registered")
+		"the TLS webhook listener should be reachable")
+
+	for _, path := range []string{
+		"/validate-infrastructure-opendatahub-io-v1alpha1-databaseclaim",
+		"/validate-infrastructure-opendatahub-io-v1alpha1-schemaclaim",
+	} {
+		pathURL := fmt.Sprintf("https://127.0.0.1:%d%s", cfg.Controller.Webhook.Port, path)
+		g.Eventually(func() error {
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, pathURL, bytes.NewReader(nil))
+			if err != nil {
+				return err
+			}
+			response, err := webhookClient.Do(request)
+			if err != nil {
+				return err
+			}
+			if err := response.Body.Close(); err != nil {
+				return err
+			}
+			// Registered handlers reject an empty body; unregistered paths return 404.
+			if response.StatusCode == http.StatusNotFound {
+				return fmt.Errorf("webhook path %s is not registered", path)
+			}
+			return nil
+		}).WithTimeout(30*time.Second).Should(Succeed(), path)
+	}
 
 	clientset, err := kubernetes.NewForConfig(restCfg)
 	g.Expect(err).NotTo(HaveOccurred())
@@ -127,7 +154,8 @@ func TestManagerStartsWebhookServerWithoutAdmissionHandlers(t *testing.T) {
 		metav1.ListOptions{},
 	)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(validating.Items).To(BeEmpty(), "no validating webhook configuration should be installed")
+	g.Expect(validating.Items).NotTo(BeEmpty(), "claim extensions ValidatingWebhookConfiguration should be installed")
+	g.Expect(validating.Items[0].Webhooks).To(HaveLen(2))
 	mutating, err := clientset.AdmissionregistrationV1().MutatingWebhookConfigurations().List(ctx, metav1.ListOptions{})
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(mutating.Items).To(BeEmpty(), "no mutating webhook configuration should be installed")

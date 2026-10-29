@@ -24,6 +24,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
+
+	"github.com/opendatahub-io/opendatahub-db-operator/pkg/resources/gvk"
 )
 
 func TestWrapOpenShiftAPIGuard(t *testing.T) {
@@ -35,6 +37,38 @@ func TestWrapOpenShiftAPIGuard(t *testing.T) {
 	))
 	g.Expect(wrapped).To(ContainSubstring("kind: SecurityContextConstraints"))
 	g.Expect(wrapped).To(HaveSuffix("{{- end }}\n"))
+}
+
+func TestWrapWebhookEnabledGuard(t *testing.T) {
+	g := NewWithT(t)
+	wrapped := wrapWebhookEnabledGuard("kind: ValidatingWebhookConfiguration\n")
+	g.Expect(wrapped).To(HavePrefix(
+		"{{- if or (not (hasKey .Values.config \"controller.webhook.enabled\")) " +
+			"(eq (toString (index .Values.config \"controller.webhook.enabled\")) \"true\") }}",
+	))
+	g.Expect(wrapped).To(ContainSubstring("kind: ValidatingWebhookConfiguration"))
+	g.Expect(wrapped).To(HaveSuffix("{{- end }}\n"))
+}
+
+func TestRenderGroup_WrapsValidatingWebhookConfiguration(t *testing.T) {
+	g := NewWithT(t)
+	obj := unstructuredFromYAML(t, `
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: example
+webhooks:
+- name: validate.example.com
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+`)
+	rendered, err := renderGroup(gvk.ValidatingWebhookConfiguration, []unstructured.Unstructured{obj}, chartContext{})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(rendered).To(HavePrefix("{{- if or (not (hasKey .Values.config"))
+	g.Expect(rendered).To(ContainSubstring("kind: ValidatingWebhookConfiguration"))
+	g.Expect(rendered).To(ContainSubstring("{{- end }}"))
 }
 
 // The sidecar's "image" field is deliberately its first key (serializes as
@@ -333,6 +367,32 @@ webhooks:
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(rendered).To(ContainSubstring("namespace: {{ .Release.Namespace }}"))
 	g.Expect(rendered).NotTo(ContainSubstring("namespace: system"))
+}
+
+func TestTransformWebhook_RewritesInjectCAFromNamespace(t *testing.T) {
+	g := NewWithT(t)
+
+	obj := unstructuredFromYAML(t, `
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: example
+  annotations:
+    cert-manager.io/inject-ca-from: odh-db-operator-system/odh-db-operator-serving-cert
+webhooks:
+- name: validate.example.com
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+`)
+
+	rendered, err := transformWebhook(&obj)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(rendered).To(ContainSubstring(
+		"cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/odh-db-operator-serving-cert",
+	))
+	g.Expect(rendered).NotTo(ContainSubstring("odh-db-operator-system/odh-db-operator-serving-cert"))
 }
 
 // A Deployment that already declares imagePullSecrets (private registry

@@ -153,6 +153,12 @@ func renderGroup(
 		// Kind and vanilla Kubernetes lack this API; skip at install time.
 		return wrapOpenShiftAPIGuard(content), nil
 	}
+	if resourceGVK == gvk.ValidatingWebhookConfiguration ||
+		resourceGVK == gvk.MutatingWebhookConfiguration {
+		// Keep Fail-policy webhook configs out of the cluster when the
+		// operator is configured not to serve them.
+		return wrapWebhookEnabledGuard(content), nil
+	}
 	return content, nil
 }
 
@@ -167,6 +173,20 @@ func wrapOpenShiftAPIGuard(content string) string {
 	const (
 		begin = "{{- if or .Values.openshift.securityContextConstraints" +
 			" (.Capabilities.APIVersions.Has \"security.openshift.io/v1\") }}\n"
+		end = "\n{{- end }}\n"
+	)
+	return begin + content + end
+}
+
+// wrapWebhookEnabledGuard renders webhook configurations only when
+// controller.webhook.enabled is absent (default true) or explicitly "true",
+// matching pkg/config.DefaultWebhookEnabled. Otherwise a Fail-policy
+// ValidatingWebhookConfiguration would reject claim traffic while no
+// webhook server is listening.
+func wrapWebhookEnabledGuard(content string) string {
+	const (
+		begin = "{{- if or (not (hasKey .Values.config \"controller.webhook.enabled\")) " +
+			"(eq (toString (index .Values.config \"controller.webhook.enabled\")) \"true\") }}\n"
 		end = "\n{{- end }}\n"
 	)
 	return begin + content + end
