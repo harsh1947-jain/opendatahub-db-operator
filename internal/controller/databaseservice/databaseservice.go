@@ -97,12 +97,18 @@ func NewReconciler(
 			))).
 		Watches(&infraApi.DatabaseClaim{},
 			reconciler.Dynamic(reconciler.CrdExists(gvk.DatabaseClaim)),
-			reconciler.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
-			reconciler.WithEventMapper(dbcontroller.BroadcastListMapper(mgr.GetClient(), &servicesv1alpha1.DatabaseServiceList{}))).
+			reconciler.WithEventMapper(dbcontroller.BroadcastListMapper(mgr.GetClient(), &servicesv1alpha1.DatabaseServiceList{})),
+			reconciler.WithPredicates(predicate.Or(
+				predicate.ResourceVersionChangedPredicate{},
+				dependent.New(dependent.WithWatchStatus(true)),
+			))).
 		Watches(&infraApi.SchemaClaim{},
 			reconciler.Dynamic(reconciler.CrdExists(gvk.SchemaClaim)),
-			reconciler.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
-			reconciler.WithEventMapper(dbcontroller.BroadcastListMapper(mgr.GetClient(), &servicesv1alpha1.DatabaseServiceList{}))).
+			reconciler.WithEventMapper(dbcontroller.BroadcastListMapper(mgr.GetClient(), &servicesv1alpha1.DatabaseServiceList{})),
+			reconciler.WithPredicates(predicate.Or(
+				predicate.ResourceVersionChangedPredicate{},
+				dependent.New(dependent.WithWatchStatus(true)),
+			))).
 		WithReconcilerOpts(
 			reconciler.WithRelease(m.platformRelease),
 			reconciler.WithDefaultRequeueAfter(retryInterval(cfg)),
@@ -112,6 +118,7 @@ func NewReconciler(
 		WithAction(m.reportStatus).
 		WithAction(m.ensureDefaultProvider).
 		WithConditions(conditions.Dependent(fwapi.ConditionType(ConditionProviderHealth), conditions.HealthyWhenTrue)).
+		WithConditions(conditions.Dependent(fwapi.ConditionType(ConditionClaimHealth), conditions.HealthyWhenTrue)).
 		WithConditions(conditions.Dependent(conditionDefaultProviderReady, conditions.HealthyWhenTrue)).
 		Build(ctx)
 
