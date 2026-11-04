@@ -3,11 +3,13 @@ package databaseservice
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/gomega"
 	fwapi "github.com/opendatahub-io/odh-platform-utilities/framework/api"
 	"github.com/opendatahub-io/odh-platform-utilities/framework/controller/conditions"
+	odhtypes "github.com/opendatahub-io/odh-platform-utilities/framework/controller/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -163,10 +165,151 @@ func TestAggregateInputsReportsFailingClaims(t *testing.T) {
 	degraded := conditions.FindStatusCondition(service, string(fwapi.ConditionTypeDegraded))
 	g.Expect(degraded).NotTo(BeNil())
 	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal("InputsUnhealthy"))
 	g.Expect(degraded.Message).To(ContainSubstring(`SchemaClaim "team-a/my-app" is not provisioned`))
 }
 
-func TestAggregateInputsIgnoresProviderBoundClaims(t *testing.T) {
+func TestAggregateInputsPreservesProviderUnreachableReason(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	service := &servicesApi.DatabaseService{
+		ObjectMeta: metav1.ObjectMeta{Name: servicesApi.DatabaseServiceInstanceName},
+	}
+	provider := &infraApi.DatabaseProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "down-provider"},
+		Status: infraApi.DatabaseProviderStatus{
+			Status: fwapi.Status{
+				Conditions: []fwapi.Condition{{
+					Type:    "Reachable",
+					Status:  metav1.ConditionFalse,
+					Reason:  "ConnectionFailed",
+					Message: "connection refused",
+				}},
+			},
+		},
+	}
+
+	m := NewModule(&moduleconfig.Config{})
+	m.apiReader = serviceTestClient(t, service, provider)
+	rr := serviceTestRequest(t, serviceTestClient(t, service), service)
+
+	g.Expect(m.aggregateInputs(ctx, rr)).To(Succeed())
+
+	degraded := conditions.FindStatusCondition(service, string(fwapi.ConditionTypeDegraded))
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal("ProviderUnreachable"))
+	g.Expect(degraded.Message).To(ContainSubstring(`DatabaseProvider "down-provider" is unreachable`))
+}
+
+func TestFailingClaimSetsDegradedWithoutClearingReady(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	service := &servicesApi.DatabaseService{
+		ObjectMeta: metav1.ObjectMeta{Name: servicesApi.DatabaseServiceInstanceName},
+	}
+	provider := &infraApi.DatabaseProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "reachable-provider"},
+		Status: infraApi.DatabaseProviderStatus{
+			Status: fwapi.Status{
+				Conditions: []fwapi.Condition{{
+					Type:   "Reachable",
+					Status: metav1.ConditionTrue,
+					Reason: "ConnectionVerified",
+				}},
+			},
+		},
+	}
+	claim := &infraApi.SchemaClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-app", Namespace: "team-a"},
+		Status: infraApi.SchemaClaimStatus{
+			Status: fwapi.Status{
+				Conditions: []fwapi.Condition{{
+					Type:    dbcontroller.ConditionProvisioned,
+					Status:  metav1.ConditionFalse,
+					Reason:  "ExtensionNotAvailable",
+					Message: `extension "vector" is not installed in the target database`,
+				}},
+			},
+		},
+	}
+
+	// Mirror production Ready dependents: ProviderHealth + DefaultProviderReady
+	// only. ClaimHealth must not clear Ready when the module infrastructure is OK.
+	aggregator, err := conditions.NewAggregator(fwapi.ConditionTypeReady,
+		conditions.Dependent(fwapi.ConditionType(ConditionProviderHealth), conditions.HealthyWhenTrue),
+		conditions.Dependent(conditionDefaultProviderReady, conditions.HealthyWhenTrue),
+	)
+	g.Expect(err).NotTo(HaveOccurred())
+	rr := &odhtypes.ReconciliationRequest{
+		Client:     serviceTestClient(t, service),
+		Instance:   service,
+		Conditions: conditions.NewManager(service, aggregator),
+	}
+
+	m := NewModule(&moduleconfig.Config{})
+	m.apiReader = serviceTestClient(t, service, provider, claim)
+	g.Expect(m.aggregateInputs(ctx, rr)).To(Succeed())
+	rr.Conditions.MarkTrue(conditionDefaultProviderReady,
+		conditions.WithReason("ProviderReady"),
+		conditions.WithMessage("default DatabaseProvider is ready"))
+	rr.Conditions.RecomputeHappiness()
+
+	claimHealth := conditions.FindStatusCondition(service, ConditionClaimHealth)
+	g.Expect(claimHealth).NotTo(BeNil())
+	g.Expect(claimHealth.Status).To(Equal(metav1.ConditionFalse))
+
+	degraded := conditions.FindStatusCondition(service, string(fwapi.ConditionTypeDegraded))
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal("InputsUnhealthy"))
+
+	ready := conditions.FindStatusCondition(service, string(fwapi.ConditionTypeReady))
+	g.Expect(ready).NotTo(BeNil())
+	g.Expect(ready.Status).To(Equal(metav1.ConditionTrue))
+}
+
+func TestAggregateInputsTreatsClaimsWithoutProvisionedAsPending(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	service := &servicesApi.DatabaseService{
+		ObjectMeta: metav1.ObjectMeta{Name: servicesApi.DatabaseServiceInstanceName},
+	}
+	provider := &infraApi.DatabaseProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "reachable-provider"},
+		Status: infraApi.DatabaseProviderStatus{
+			Status: fwapi.Status{
+				Conditions: []fwapi.Condition{{
+					Type:   "Reachable",
+					Status: metav1.ConditionTrue,
+					Reason: "ConnectionVerified",
+				}},
+			},
+		},
+	}
+	claim := &infraApi.SchemaClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "fresh", Namespace: "team-a"},
+	}
+
+	m := NewModule(&moduleconfig.Config{})
+	m.apiReader = serviceTestClient(t, service, provider, claim)
+	rr := serviceTestRequest(t, serviceTestClient(t, service), service)
+
+	g.Expect(m.aggregateInputs(ctx, rr)).To(Succeed())
+
+	claimHealth := conditions.FindStatusCondition(service, ConditionClaimHealth)
+	g.Expect(claimHealth).NotTo(BeNil())
+	g.Expect(claimHealth.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(claimHealth.Reason).To(Equal("ClaimsPending"))
+	g.Expect(claimHealth.Message).To(ContainSubstring("Waiting for 1 claim"))
+	g.Expect(claimHealth.Message).NotTo(ContainSubstring("All DatabaseClaim and SchemaClaim resources are provisioned"))
+
+	degraded := conditions.FindStatusCondition(service, string(fwapi.ConditionTypeDegraded))
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionFalse))
+}
+
+func TestAggregateInputsTreatsProviderBoundClaimsAsPending(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 	service := &servicesApi.DatabaseService{
@@ -191,7 +334,7 @@ func TestAggregateInputsIgnoresProviderBoundClaims(t *testing.T) {
 				Conditions: []fwapi.Condition{{
 					Type:    dbcontroller.ConditionProvisioned,
 					Status:  metav1.ConditionFalse,
-					Reason:  reasonProviderBound,
+					Reason:  dbcontroller.ReasonProviderBound,
 					Message: `bound to DatabaseProvider "reachable-provider"; provisioning on next reconcile`,
 				}},
 			},
@@ -206,8 +349,10 @@ func TestAggregateInputsIgnoresProviderBoundClaims(t *testing.T) {
 
 	claimHealth := conditions.FindStatusCondition(service, ConditionClaimHealth)
 	g.Expect(claimHealth).NotTo(BeNil())
-	g.Expect(claimHealth.Status).To(Equal(metav1.ConditionTrue))
-	g.Expect(claimHealth.Reason).To(Equal("ClaimsProvisioned"))
+	g.Expect(claimHealth.Status).To(Equal(metav1.ConditionUnknown))
+	g.Expect(claimHealth.Reason).To(Equal("ClaimsPending"))
+	g.Expect(claimHealth.Message).To(ContainSubstring("Waiting for 1 claim"))
+	g.Expect(claimHealth.Message).NotTo(ContainSubstring("All DatabaseClaim and SchemaClaim resources are provisioned"))
 
 	degraded := conditions.FindStatusCondition(service, string(fwapi.ConditionTypeDegraded))
 	g.Expect(degraded).NotTo(BeNil())
@@ -230,9 +375,9 @@ func TestAggregateInputsDegradedMessageWhenNoProvidersConfigured(t *testing.T) {
 	degraded := conditions.FindStatusCondition(service, string(fwapi.ConditionTypeDegraded))
 	g.Expect(degraded).NotTo(BeNil())
 	g.Expect(degraded.Status).To(Equal(metav1.ConditionFalse))
-	g.Expect(degraded.Reason).To(Equal("InputsHealthy"))
+	g.Expect(degraded.Reason).To(Equal("NoProvidersConfigured"))
+	g.Expect(degraded.Severity).To(Equal(fwapi.ConditionSeverityInfo))
 	g.Expect(degraded.Message).To(ContainSubstring("No DatabaseProvider resources exist"))
-	g.Expect(degraded.Message).NotTo(Equal(degradedHealthyDefaultMessage))
 }
 
 func TestAggregateInputsPrunesDeletedClaimMetrics(t *testing.T) {
@@ -270,12 +415,16 @@ func TestAggregateInputsPrunesDeletedClaimMetrics(t *testing.T) {
 	m.apiReader = serviceTestClient(t, service, provider, current)
 	rr := serviceTestRequest(t, serviceTestClient(t, service), service)
 
+	t.Cleanup(func() { dbmetrics.PruneClaimMetrics(nil) })
 	dbmetrics.PruneClaimMetrics(nil)
 	dbmetrics.SetClaimProvisioned(infraApi.DatabaseClaimKind, "app", "removed", false)
 	dbmetrics.SetClaimProvisioned(infraApi.DatabaseClaimKind, "app", "current", true)
 	g.Expect(m.aggregateInputs(ctx, rr)).To(Succeed())
-	g.Expect(testutil.GatherAndCount(ctrlmetrics.Registry, "dbclaim_provisioned")).To(Equal(1))
-	dbmetrics.PruneClaimMetrics(nil)
+	g.Expect(testutil.GatherAndCompare(ctrlmetrics.Registry, strings.NewReader(`
+# HELP dbclaim_provisioned Whether a DatabaseClaim or SchemaClaim is provisioned
+# TYPE dbclaim_provisioned gauge
+dbclaim_provisioned{kind="DatabaseClaim",name="current",namespace="app"} 1
+`), "dbclaim_provisioned")).To(Succeed())
 }
 
 func serviceTestClientWithListError(

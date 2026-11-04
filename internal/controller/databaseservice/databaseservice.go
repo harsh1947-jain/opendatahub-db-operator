@@ -97,18 +97,12 @@ func NewReconciler(
 			))).
 		Watches(&infraApi.DatabaseClaim{},
 			reconciler.Dynamic(reconciler.CrdExists(gvk.DatabaseClaim)),
-			reconciler.WithEventMapper(dbcontroller.BroadcastListMapper(mgr.GetClient(), &servicesv1alpha1.DatabaseServiceList{})),
-			reconciler.WithPredicates(predicate.Or(
-				predicate.ResourceVersionChangedPredicate{},
-				dependent.New(dependent.WithWatchStatus(true)),
-			))).
+			reconciler.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+			reconciler.WithEventMapper(dbcontroller.BroadcastListMapper(mgr.GetClient(), &servicesv1alpha1.DatabaseServiceList{}))).
 		Watches(&infraApi.SchemaClaim{},
 			reconciler.Dynamic(reconciler.CrdExists(gvk.SchemaClaim)),
-			reconciler.WithEventMapper(dbcontroller.BroadcastListMapper(mgr.GetClient(), &servicesv1alpha1.DatabaseServiceList{})),
-			reconciler.WithPredicates(predicate.Or(
-				predicate.ResourceVersionChangedPredicate{},
-				dependent.New(dependent.WithWatchStatus(true)),
-			))).
+			reconciler.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+			reconciler.WithEventMapper(dbcontroller.BroadcastListMapper(mgr.GetClient(), &servicesv1alpha1.DatabaseServiceList{}))).
 		WithReconcilerOpts(
 			reconciler.WithRelease(m.platformRelease),
 			reconciler.WithDefaultRequeueAfter(retryInterval(cfg)),
@@ -117,8 +111,11 @@ func NewReconciler(
 		WithFinalizer(m.cleanupDefaultProvider).
 		WithAction(m.reportStatus).
 		WithAction(m.ensureDefaultProvider).
+		// Ready tracks module infrastructure (providers + default-provider
+		// management). ClaimHealth stays on status and Degraded so tenant
+		// claim bind failures are visible without taking the module out of
+		// Ready for every other consumer.
 		WithConditions(conditions.Dependent(fwapi.ConditionType(ConditionProviderHealth), conditions.HealthyWhenTrue)).
-		WithConditions(conditions.Dependent(fwapi.ConditionType(ConditionClaimHealth), conditions.HealthyWhenTrue)).
 		WithConditions(conditions.Dependent(conditionDefaultProviderReady, conditions.HealthyWhenTrue)).
 		Build(ctx)
 

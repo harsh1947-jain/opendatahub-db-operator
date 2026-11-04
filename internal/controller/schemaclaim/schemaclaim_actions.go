@@ -34,6 +34,7 @@ import (
 	infraApi "github.com/opendatahub-io/opendatahub-db-operator/api/infrastructure/v1alpha1"
 	dbcontroller "github.com/opendatahub-io/opendatahub-db-operator/pkg/controller"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/controller/claimerrors"
+	dbmetrics "github.com/opendatahub-io/opendatahub-db-operator/pkg/metrics"
 	"github.com/opendatahub-io/opendatahub-db-operator/pkg/postgres"
 )
 
@@ -52,9 +53,9 @@ func (m *Controller) provisionAction(ctx context.Context, rr *odhtypes.Reconcili
 		if notFound, ok := errors.AsType[dbcontroller.ErrNotFound](err); ok {
 			dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
 				conditions.WithError(notFound),
-				conditions.WithReason("ProviderNotFound"))
+				conditions.WithReason(dbcontroller.ReasonProviderNotFound))
 			rr.Conditions.Mark(ConditionTLSConfiguration, metav1.ConditionUnknown,
-				conditions.WithReason("ProviderNotFound"),
+				conditions.WithReason(dbcontroller.ReasonProviderNotFound),
 				conditions.WithMessage(notFound.Error()))
 			return odherrors.NewStopErrorW(err).WithRequeueAfter(m.retryInterval())
 		}
@@ -68,10 +69,10 @@ func (m *Controller) provisionAction(ctx context.Context, rr *odhtypes.Reconcili
 	if obj.Status.Provider != provider.Name {
 		obj.Status.Provider = provider.Name
 		dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
-			conditions.WithReason("ProviderBound"),
+			conditions.WithReason(dbcontroller.ReasonProviderBound),
 			conditions.WithMessage(fmt.Sprintf("bound to DatabaseProvider %q; provisioning on next reconcile", provider.Name)))
 		rr.Conditions.Mark(ConditionTLSConfiguration, metav1.ConditionUnknown,
-			conditions.WithReason("ProviderBound"),
+			conditions.WithReason(dbcontroller.ReasonProviderBound),
 			conditions.WithMessage(fmt.Sprintf("waiting to provision against DatabaseProvider %q", provider.Name)))
 		return odherrors.NewStopErrorW(fmt.Errorf("persisted provider binding %q", provider.Name)).
 			WithRequeueAfter(providerBindingRequeueAfter)
@@ -83,10 +84,10 @@ func (m *Controller) provisionAction(ctx context.Context, rr *odhtypes.Reconcili
 
 	if !dbcontroller.ProviderReachable(provider.GetConditions()) {
 		dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
-			conditions.WithReason("ProviderNotReady"),
+			conditions.WithReason(dbcontroller.ReasonProviderNotReady),
 			conditions.WithMessage(fmt.Sprintf("DatabaseProvider %q is not Reachable", provider.Name)))
 		rr.Conditions.Mark(ConditionTLSConfiguration, metav1.ConditionUnknown,
-			conditions.WithReason("ProviderNotReady"),
+			conditions.WithReason(dbcontroller.ReasonProviderNotReady),
 			conditions.WithMessage(fmt.Sprintf("waiting for DatabaseProvider %q to become Reachable", provider.Name)))
 		return odherrors.NewStopErrorW(fmt.Errorf("provider %q not reachable", provider.Name)).
 			WithRequeueAfter(m.retryInterval())
@@ -125,38 +126,38 @@ func (m *Controller) provisionAction(ctx context.Context, rr *odhtypes.Reconcili
 	secret, err := provisioner.Ensure(ctx)
 	if notFound, ok := errors.AsType[claimerrors.DatabaseNotFound](err); ok {
 		dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
-			conditions.WithReason("DatabaseNotFound"),
+			conditions.WithReason(dbcontroller.ReasonDatabaseNotFound),
 			conditions.WithMessage(fmt.Sprintf("database %q does not exist on provider %q", notFound.Database, provider.Name)))
 		return odherrors.NewStopErrorW(notFound).WithRequeueAfter(m.retryInterval())
 	}
 	if denied, ok := errors.AsType[claimerrors.SchemaCreateNotAllowed](err); ok {
 		dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
-			conditions.WithReason("SchemaCreateNotAllowed"),
+			conditions.WithReason(dbcontroller.ReasonSchemaCreateNotAllowed),
 			conditions.WithMessage(denied.Error()))
 		// Terminal policy denial: do not polite-requeue; wait for a claim/provider change.
 		return odherrors.NewStopErrorW(denied)
 	}
 	if reserved, ok := errors.AsType[claimerrors.SchemaReserved](err); ok {
 		dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
-			conditions.WithReason("SchemaReserved"),
+			conditions.WithReason(dbcontroller.ReasonSchemaReserved),
 			conditions.WithMessage(reserved.Error()))
 		return odherrors.NewStopErrorW(reserved)
 	}
 	if notOwned, ok := errors.AsType[claimerrors.SchemaNotOwned](err); ok {
 		dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
-			conditions.WithReason("SchemaNotOwned"),
+			conditions.WithReason(dbcontroller.ReasonSchemaNotOwned),
 			conditions.WithMessage(notOwned.Error()))
 		return odherrors.NewStopErrorW(notOwned)
 	}
 	if secretNotOwned, ok := errors.AsType[claimerrors.SecretNotOwned](err); ok {
 		dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
-			conditions.WithReason("SecretNotOwned"),
+			conditions.WithReason(dbcontroller.ReasonSecretNotOwned),
 			conditions.WithMessage(secretNotOwned.Error()))
 		return odherrors.NewStopErrorW(secretNotOwned)
 	}
 	if missingExt, ok := errors.AsType[claimerrors.ExtensionNotAvailable](err); ok {
 		dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
-			conditions.WithReason("ExtensionNotAvailable"),
+			conditions.WithReason(dbcontroller.ReasonExtensionNotAvailable),
 			conditions.WithMessage(missingExt.Error()))
 		// Out-of-band install in the target DB; requeue like DatabaseNotFound.
 		return odherrors.NewStopErrorW(missingExt).WithRequeueAfter(m.retryInterval())
@@ -180,7 +181,7 @@ func (m *Controller) provisionAction(ctx context.Context, rr *odhtypes.Reconcili
 	obj.Status.Schema = connection.Schema
 	obj.Status.Connection = connection
 	dbcontroller.MarkClaimProvisioned(rr, metav1.ConditionTrue,
-		conditions.WithReason("SchemaProvisioned"),
+		conditions.WithReason(dbcontroller.ReasonSchemaProvisioned),
 		conditions.WithMessage(fmt.Sprintf("Schema %q provisioned on database %q (provider %q)", connection.Schema, connection.Database, provider.Name)))
 
 	return nil
@@ -209,6 +210,10 @@ func (m *Controller) cleanupAction(ctx context.Context, rr *odhtypes.Reconciliat
 	if !ok {
 		return fmt.Errorf("instance is not a SchemaClaim")
 	}
+
+	// Drop the series as soon as cleanup starts so metrics follow claim
+	// deletion even when DatabaseService is absent and cannot prune.
+	dbmetrics.DeleteClaimProvisioned(infraApi.SchemaClaimKind, obj.Namespace, obj.Name)
 
 	role := dbcontroller.RoleNameForSchemaClaim(obj.Namespace, obj.Name)
 

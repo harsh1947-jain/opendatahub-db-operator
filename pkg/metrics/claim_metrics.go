@@ -53,6 +53,19 @@ func SetClaimProvisioned(kind, namespace, name string, provisioned bool) {
 	claimProvisioned.WithLabelValues(key.labelValues()...).Set(value)
 }
 
+// DeleteClaimProvisioned removes one claim's series. Claim cleanup calls this
+// so metrics follow claim deletion even when DatabaseService is absent and
+// cannot prune.
+func DeleteClaimProvisioned(kind, namespace, name string) {
+	key := ClaimKey{Kind: kind, Namespace: namespace, Name: name}
+
+	claimMutex.Lock()
+	defer claimMutex.Unlock()
+
+	delete(claimKeys, key.id())
+	claimProvisioned.DeleteLabelValues(key.labelValues()...)
+}
+
 func PruneClaimMetrics(currentClaims []ClaimKey) {
 	current := make(map[string]struct{}, len(currentClaims))
 	for _, claim := range currentClaims {

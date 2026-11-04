@@ -39,8 +39,6 @@ const (
 	ConditionProviderHealth = "ProviderHealth"
 	ConditionServerVersion  = "ServerVersion"
 	ConditionClaimHealth    = "ClaimHealth"
-
-	reasonProviderBound = "ProviderBound"
 )
 
 func (m *Module) reportStatus(ctx context.Context, rr *odhtypes.ReconciliationRequest) error {
@@ -68,40 +66,46 @@ func (m *Module) aggregateInputs(
 		return err
 	}
 
-	hardFailures := append(append([]string{}, providerHardFailures...), claimHardFailures...)
-	if len(hardFailures) > 0 {
-		message := strings.Join(hardFailures, "; ")
-		rr.Conditions.Mark(fwapi.ConditionTypeDegraded, metav1.ConditionTrue,
-			conditions.WithReason("InputsUnhealthy"),
-			conditions.WithMessage(message))
-		return nil
-	}
-
-	rr.Conditions.Mark(fwapi.ConditionTypeDegraded, metav1.ConditionFalse,
-		conditions.WithReason("InputsHealthy"),
-		conditions.WithMessage(degradedHealthyMessage(rr)))
+	markDegradedFromInputs(rr, providerHardFailures, claimHardFailures)
 	return nil
 }
 
-const degradedHealthyDefaultMessage = "Providers and claims are healthy"
+// markDegradedFromInputs preserves pre-claim Degraded reasons when only
+// providers contribute, and uses InputsUnhealthy only when claim failures are
+// part of the rollup so existing consumers keep stable provider-only status.
+func markDegradedFromInputs(rr *odhtypes.ReconciliationRequest, providerHardFailures, claimHardFailures []string) {
+	if len(claimHardFailures) > 0 {
+		message := strings.Join(append(append([]string{}, providerHardFailures...), claimHardFailures...), "; ")
+		rr.Conditions.Mark(fwapi.ConditionTypeDegraded, metav1.ConditionTrue,
+			conditions.WithReason("InputsUnhealthy"),
+			conditions.WithMessage(message))
+		return
+	}
+	if len(providerHardFailures) > 0 {
+		message := strings.Join(providerHardFailures, "; ")
+		rr.Conditions.Mark(fwapi.ConditionTypeDegraded, metav1.ConditionTrue,
+			conditions.WithReason("ProviderUnreachable"),
+			conditions.WithMessage(message))
+		return
+	}
 
-// degradedHealthyMessage summarizes non-hard input state on Degraded when status is False.
-// Informational provider/claim conditions (for example zero providers) stay visible here
-// without setting Degraded=True.
-func degradedHealthyMessage(rr *odhtypes.ReconciliationRequest) string {
-	var parts []string
-	if providerHealth := conditions.FindStatusCondition(rr.Instance, ConditionProviderHealth); providerHealth != nil &&
-		providerHealth.Status != metav1.ConditionTrue && providerHealth.Message != "" {
-		parts = append(parts, providerHealth.Message)
+	providerHealth := conditions.FindStatusCondition(rr.Instance, ConditionProviderHealth)
+	if providerHealth != nil &&
+		(providerHealth.Reason == "NoProvidersConfigured" || providerHealth.Reason == "DatabaseProviderCRDMissing") {
+		rr.Conditions.Mark(fwapi.ConditionTypeDegraded, metav1.ConditionFalse,
+			conditions.WithSeverity(fwapi.ConditionSeverityInfo),
+			conditions.WithReason(providerHealth.Reason),
+			conditions.WithMessage(providerHealth.Message))
+		return
 	}
-	if claimHealth := conditions.FindStatusCondition(rr.Instance, ConditionClaimHealth); claimHealth != nil &&
-		claimHealth.Status != metav1.ConditionTrue && claimHealth.Message != "" {
-		parts = append(parts, claimHealth.Message)
+
+	message := "All DatabaseProvider resources are reachable"
+	if providerHealth != nil && providerHealth.Message != "" {
+		message = providerHealth.Message
 	}
-	if len(parts) == 0 {
-		return degradedHealthyDefaultMessage
-	}
-	return strings.Join(parts, "; ")
+	rr.Conditions.Mark(fwapi.ConditionTypeDegraded, metav1.ConditionFalse,
+		conditions.WithReason("ProvidersReachable"),
+		conditions.WithMessage(message))
 }
 
 func (m *Module) aggregateProviders(
@@ -242,6 +246,7 @@ func (m *Module) aggregateClaims(
 
 	currentClaims := make([]dbmetrics.ClaimKey, 0, len(databaseClaims.Items)+len(schemaClaims.Items))
 	failingMessages := make([]string, 0)
+	pendingCount := 0
 	for i := range databaseClaims.Items {
 		claim := &databaseClaims.Items[i]
 		currentClaims = append(currentClaims, dbmetrics.ClaimKey{
@@ -249,8 +254,15 @@ func (m *Module) aggregateClaims(
 			Namespace: claim.Namespace,
 			Name:      claim.Name,
 		})
-		if msg, failing := failingClaimMessage(infraApi.DatabaseClaimKind, claim.Namespace, claim.Name, conditions.FindStatusCondition(claim, dbcontroller.ConditionProvisioned)); failing {
+		msg, failing, pending := classifyClaimProvisioned(
+			infraApi.DatabaseClaimKind, claim.Namespace, claim.Name,
+			conditions.FindStatusCondition(claim, dbcontroller.ConditionProvisioned),
+		)
+		if failing {
 			failingMessages = append(failingMessages, msg)
+		}
+		if pending {
+			pendingCount++
 		}
 	}
 	for i := range schemaClaims.Items {
@@ -260,8 +272,15 @@ func (m *Module) aggregateClaims(
 			Namespace: claim.Namespace,
 			Name:      claim.Name,
 		})
-		if msg, failing := failingClaimMessage(infraApi.SchemaClaimKind, claim.Namespace, claim.Name, conditions.FindStatusCondition(claim, dbcontroller.ConditionProvisioned)); failing {
+		msg, failing, pending := classifyClaimProvisioned(
+			infraApi.SchemaClaimKind, claim.Namespace, claim.Name,
+			conditions.FindStatusCondition(claim, dbcontroller.ConditionProvisioned),
+		)
+		if failing {
 			failingMessages = append(failingMessages, msg)
+		}
+		if pending {
+			pendingCount++
 		}
 	}
 	dbmetrics.PruneClaimMetrics(currentClaims)
@@ -272,6 +291,15 @@ func (m *Module) aggregateClaims(
 			conditions.WithReason("ClaimsNotProvisioned"),
 			conditions.WithMessage(message))
 		return failingMessages, nil
+	}
+
+	if pendingCount > 0 {
+		rr.Conditions.Mark(ConditionClaimHealth, metav1.ConditionUnknown,
+			conditions.WithSeverity(fwapi.ConditionSeverityInfo),
+			conditions.WithReason("ClaimsPending"),
+			conditions.WithMessage(fmt.Sprintf(
+				"Waiting for %d claim(s) to report Provisioned status", pendingCount)))
+		return nil, nil
 	}
 
 	message := "All DatabaseClaim and SchemaClaim resources are provisioned"
@@ -286,17 +314,23 @@ func (m *Module) aggregateClaims(
 	return nil, nil
 }
 
-func failingClaimMessage(kind, namespace, name string, provisioned *fwapi.Condition) (string, bool) {
-	if provisioned != nil && provisioned.Status == metav1.ConditionTrue {
-		return "", false
+// classifyClaimProvisioned reports whether a claim is failing to bind, still
+// pending first status, or neither. Missing Provisioned and ProviderBound are
+// transient (not yet provisioned) and must not degrade DatabaseService.
+func classifyClaimProvisioned(kind, namespace, name string, provisioned *fwapi.Condition) (string, bool, bool) {
+	if provisioned == nil {
+		return "", false, true
 	}
-	if provisioned != nil && provisioned.Reason == reasonProviderBound {
-		return "", false
+	if provisioned.Status == metav1.ConditionTrue {
+		return "", false, false
+	}
+	if provisioned.Reason == dbcontroller.ReasonProviderBound {
+		return "", false, true
 	}
 
-	detail := "claim provisioning status is unknown"
-	if provisioned != nil && provisioned.Message != "" {
-		detail = provisioned.Message
+	detail := provisioned.Message
+	if detail == "" {
+		detail = "claim is not provisioned"
 	}
 	return fmt.Sprintf(
 		`%s "%s/%s" is not provisioned: %s. %s`,
@@ -305,29 +339,26 @@ func failingClaimMessage(kind, namespace, name string, provisioned *fwapi.Condit
 		name,
 		detail,
 		correctiveActionForClaim(provisioned),
-	), true
+	), true, false
 }
 
 func correctiveActionForClaim(provisioned *fwapi.Condition) string {
-	if provisioned == nil {
-		return "Inspect the claim status and resolve the reported provisioning error."
-	}
 	switch provisioned.Reason {
-	case "ExtensionNotAvailable":
+	case dbcontroller.ReasonExtensionNotAvailable:
 		return "Install the required extension in the target database or remove it from the claim spec."
-	case "ExtensionNotSupported":
+	case dbcontroller.ReasonExtensionNotSupported:
 		return "Remove unsupported extensions from the claim spec."
-	case "ProviderNotFound":
+	case dbcontroller.ReasonProviderNotFound:
 		return "Create a matching DatabaseProvider or fix the claim provider reference."
-	case "ProviderNotReady":
+	case dbcontroller.ReasonProviderNotReady:
 		return "Restore DatabaseProvider reachability, then wait for the claim to reprovision."
-	case "DatabaseNotFound":
+	case dbcontroller.ReasonDatabaseNotFound:
 		return "Create the database on the provider or update the claim to an existing database."
-	case "DatabaseCreateNotAllowed", "SchemaCreateNotAllowed":
+	case dbcontroller.ReasonDatabaseCreateNotAllowed, dbcontroller.ReasonSchemaCreateNotAllowed:
 		return "Enable the required create capability on the provider or change the claim request."
-	case "SchemaReserved":
+	case dbcontroller.ReasonSchemaReserved:
 		return "Choose a non-reserved schema name on the claim."
-	case "SchemaNotOwned", "SecretNotOwned":
+	case dbcontroller.ReasonSchemaNotOwned, dbcontroller.ReasonSecretNotOwned:
 		return "Resolve the ownership conflict for the existing schema or credentials Secret."
 	default:
 		return "Inspect the claim status and resolve the reported provisioning error."

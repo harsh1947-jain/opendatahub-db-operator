@@ -47,4 +47,17 @@ func TestClaimMetrics(t *testing.T) {
 		g.Expect(testutil.CollectAndCount(claimProvisioned)).To(Equal(1))
 		g.Expect(testutil.ToFloat64(claimProvisioned.WithLabelValues("DatabaseClaim", "team-b", "current"))).To(Equal(1.0))
 	})
+
+	t.Run("deletes a single claim series", func(t *testing.T) {
+		g := NewWithT(t)
+
+		claimProvisioned.Reset()
+		SetClaimProvisioned("SchemaClaim", "team-a", "gone", true)
+		SetClaimProvisioned("DatabaseClaim", "team-b", "keep", false)
+
+		DeleteClaimProvisioned("SchemaClaim", "team-a", "gone")
+
+		g.Expect(testutil.CollectAndCount(claimProvisioned)).To(Equal(1))
+		g.Expect(testutil.ToFloat64(claimProvisioned.WithLabelValues("DatabaseClaim", "team-b", "keep"))).To(Equal(0.0))
+	})
 }

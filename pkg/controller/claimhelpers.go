@@ -209,7 +209,7 @@ func MarkClaimProvisioned(
 func StopIfUnsupportedClaimExtensions(rr *odhtypes.ReconciliationRequest, extensions []string) error {
 	if err := ValidateClaimExtensions(extensions); err != nil {
 		MarkClaimProvisioned(rr, metav1.ConditionFalse,
-			conditions.WithReason("ExtensionNotSupported"),
+			conditions.WithReason(ReasonExtensionNotSupported),
 			conditions.WithMessage(err.Error()))
 		return odherrors.NewStopErrorW(err)
 	}

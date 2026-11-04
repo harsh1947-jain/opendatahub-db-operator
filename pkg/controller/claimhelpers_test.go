@@ -137,8 +137,9 @@ func (stubClient) QueryRow(context.Context, string, ...any) (pgx.Row, error) {
 
 func TestMarkClaimProvisioned_UpdatesMetric(t *testing.T) {
 	g := NewWithT(t)
-
+	t.Cleanup(func() { dbmetrics.PruneClaimMetrics(nil) })
 	dbmetrics.PruneClaimMetrics(nil)
+
 	claim := &infraApi.SchemaClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-app", Namespace: "team-a"},
 	}
@@ -155,7 +156,11 @@ func TestMarkClaimProvisioned_UpdatesMetric(t *testing.T) {
 	controller.MarkClaimProvisioned(rr, metav1.ConditionFalse,
 		conditions.WithReason("ExtensionNotAvailable"),
 		conditions.WithMessage(`required extension "vector" is not available`))
-	g.Expect(testutil.GatherAndCount(ctrlmetrics.Registry, "dbclaim_provisioned")).To(Equal(1))
+	g.Expect(testutil.GatherAndCompare(ctrlmetrics.Registry, strings.NewReader(`
+# HELP dbclaim_provisioned Whether a DatabaseClaim or SchemaClaim is provisioned
+# TYPE dbclaim_provisioned gauge
+dbclaim_provisioned{kind="SchemaClaim",name="my-app",namespace="team-a"} 0
+`), "dbclaim_provisioned")).To(Succeed())
 	provisioned := conditions.FindStatusCondition(claim, controller.ConditionProvisioned)
 	g.Expect(provisioned).NotTo(BeNil())
 	g.Expect(provisioned.Status).To(Equal(metav1.ConditionFalse))
@@ -165,9 +170,11 @@ func TestMarkClaimProvisioned_UpdatesMetric(t *testing.T) {
 		conditions.WithReason("SchemaProvisioned"),
 		conditions.WithMessage("provisioned"))
 	g.Expect(conditions.FindStatusCondition(claim, controller.ConditionProvisioned).Status).To(Equal(metav1.ConditionTrue))
-
-	dbmetrics.PruneClaimMetrics(nil)
-	g.Expect(testutil.GatherAndCount(ctrlmetrics.Registry, "dbclaim_provisioned")).To(Equal(0))
+	g.Expect(testutil.GatherAndCompare(ctrlmetrics.Registry, strings.NewReader(`
+# HELP dbclaim_provisioned Whether a DatabaseClaim or SchemaClaim is provisioned
+# TYPE dbclaim_provisioned gauge
+dbclaim_provisioned{kind="SchemaClaim",name="my-app",namespace="team-a"} 1
+`), "dbclaim_provisioned")).To(Succeed())
 }
 
 func TestEnsureClaimExtensions_EmptyNoop(t *testing.T) {
