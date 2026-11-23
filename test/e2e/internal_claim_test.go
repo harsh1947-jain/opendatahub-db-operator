@@ -181,6 +181,7 @@ func TestInternalProviderClaimLifecycle(t *testing.T) {
 		adminSecretCopy.Name, string(credentials.Data["dbname"]),
 		string(credentials.Data["user"]), expectedSSLMode, image, tlsEnabled)
 	runConsumer(t, ctx, cli, restCfg, namespace.Name, claim.Name, image, tlsEnabled)
+	runAccessorConsumer(t, ctx, cli, restCfg, namespace.Name, claim.Name, image, tlsEnabled)
 
 	g.Expect(cli.Delete(ctx, claim, client.Preconditions{UID: &claim.UID})).To(Succeed())
 	g.Eventually(func(g Gomega) {

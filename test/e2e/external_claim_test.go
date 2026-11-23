@@ -147,6 +147,7 @@ func TestExternalProviderClaimLifecycle(t *testing.T) {
 		string(credentials.Data["dbname"]), string(credentials.Data["user"]),
 		string(adminSecret.Data["sslmode"]), image, true)
 	runConsumer(t, ctx, cli, restCfg, namespace.Name, claim.Name, image, true)
+	runAccessorConsumer(t, ctx, cli, restCfg, namespace.Name, claim.Name, image, true)
 
 	g.Expect(cli.Delete(ctx, claim, client.Preconditions{UID: &claim.UID})).To(Succeed())
 	g.Eventually(func(g Gomega) {

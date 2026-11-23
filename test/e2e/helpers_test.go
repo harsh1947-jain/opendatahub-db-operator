@@ -89,7 +89,7 @@ case "$DB_SSLMODE" in
         ;;
 esac
 query='INSERT INTO public.claim_contract_test VALUES (42);'
-query="$query SELECT ssl, (SELECT value FROM public.claim_contract_test)"
+query="$query SELECT ssl, (SELECT value FROM public.claim_contract_test WHERE value = 42 LIMIT 1)"
 query="$query FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
 result=$(psql -X -qAt -v ON_ERROR_STOP=1 "$connection" -c "$query")
 test "$result" = "$expected"

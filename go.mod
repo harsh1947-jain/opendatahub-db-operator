@@ -9,8 +9,8 @@ require (
 	github.com/invopop/jsonschema v0.14.0
 	github.com/k8s-manifest-kit/renderer-gotemplate v0.1.1-0.20260716120521-c6314e947363
 	github.com/onsi/gomega v1.44.0
-	github.com/opendatahub-io/odh-platform-utilities v0.3.1-0.20260910142511-54dc15029883
-	github.com/opendatahub-io/odh-platform-utilities/framework v0.0.0-20260910142511-54dc15029883
+	github.com/opendatahub-io/odh-platform-utilities v0.6.1-0.20261120092943-fd90aee56a8a
+	github.com/opendatahub-io/odh-platform-utilities/framework v0.6.1-0.20261120092943-fd90aee56a8a
 	github.com/operator-framework/api v0.45.0
 	github.com/prometheus/client_golang v1.24.0
 	github.com/rs/xid v1.6.0
@@ -64,7 +64,8 @@ require (
 	github.com/moby/sys/userns v0.1.0 // indirect
 	github.com/moby/term v0.5.2 // indirect
 	github.com/monochromegane/go-gitignore v0.0.0-20200626010858-205db1a8cc00 // indirect
-	github.com/openshift/library-go v0.0.0-20260213153706-03f1709971c5 // indirect
+	github.com/openshift/controller-runtime-common v0.0.0-20261026124434-bdfc411d93cd // indirect
+	github.com/openshift/library-go v0.0.0-20261001144932-192662696fc7 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.5 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
@@ -73,8 +74,8 @@ require (
 	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/xlab/treeprint v1.2.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	golang.org/x/mod v0.37.0 // indirect
-	golang.org/x/tools v0.47.0 // indirect
+	golang.org/x/mod v0.38.0 // indirect
+	golang.org/x/tools v0.48.0 // indirect
 	gotest.tools/gotestsum v1.13.0 // indirect
 	sigs.k8s.io/kustomize/api v0.20.1 // indirect
 )
@@ -140,7 +141,7 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
-	github.com/openshift/api v0.0.0-20260610192510-1b2a074e0bd6
+	github.com/openshift/api v0.0.0-20261002115817-f8795cdde518
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
@@ -177,7 +178,7 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect

@@ -31,7 +31,7 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
-	platformtls "github.com/opendatahub-io/odh-platform-utilities/pkg/tls"
+	platformtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
 	configv1 "github.com/openshift/api/config/v1"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )

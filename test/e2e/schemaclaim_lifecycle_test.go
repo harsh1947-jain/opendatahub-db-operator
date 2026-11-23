@@ -302,6 +302,10 @@ func TestSchemaClaimLifecycle(t *testing.T) {
 		"cross_read_denied",
 	)
 
+	// Accessor search_path: unqualified write via ParseClaimSecret → Libpq
+	// lands in the claimed schema, not public.
+	runAccessorSearchPathConsumer(t, ctx, cli, restCfg, namespace.Name, retainSecretName, image, tlsEnabled)
+
 	retainSchema := string(retainSecret.Data[postgres.SecretKeySchema])
 	retainRole := string(retainSecret.Data[postgres.SecretKeyUser])
 	deleteSchema := string(deleteSecret.Data[postgres.SecretKeySchema])

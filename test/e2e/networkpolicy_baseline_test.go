@@ -267,6 +267,7 @@ func TestOperatorRunsUnderDefaultDenyBaseline(t *testing.T) {
 		adminSecretCopy.Name, string(credentials.Data["dbname"]),
 		string(credentials.Data["user"]), "disable", image, false)
 	runConsumer(t, ctx, cli, restCfg, consumerNamespace.Name, claim.Name, image, false)
+	runAccessorConsumer(t, ctx, cli, restCfg, consumerNamespace.Name, claim.Name, image, false)
 
 	// Remove the baseline before the t.Cleanup stack runs, so claim and
 	// provider teardown (finalizer reconciliation) happens with normal
