@@ -59,6 +59,9 @@ const (
 	SSLModeVerifyCA   = "verify-ca"
 	SSLModeVerifyFull = "verify-full"
 
+	SSLModePrefer = "prefer"
+	SSLModeAllow  = "allow"
+
 	// AnnotationConnectionTypeProtocol is the ODH Connection API annotation
 	// that marks a Secret as a postgres connection artifact.
 	AnnotationConnectionTypeProtocol = "opendatahub.io/connection-type-protocol"
@@ -132,10 +135,21 @@ func (c Config) validate(requireDatabase bool) error {
 	if c.Port <= 0 || c.Port > 65535 {
 		return fmt.Errorf("invalid %s: must be a port number 1-65535, got %d", SecretKeyPort, c.Port)
 	}
+	switch c.SSLMode {
+	case "", SSLModeDisable, SSLModeRequire, SSLModeVerifyCA, SSLModeVerifyFull,
+		SSLModePrefer, SSLModeAllow:
+	default:
+		// Do not echo the Secret value: this error is copied into provider status.
+		return fmt.Errorf("unsupported %s: use %s, %s, %s, %s, %s, or %s",
+			SecretKeySSLMode,
+			SSLModeDisable, SSLModeAllow, SSLModePrefer, SSLModeRequire,
+			SSLModeVerifyCA, SSLModeVerifyFull)
+	}
 	return nil
 }
 
-// Validate checks that all required Config fields are set and the port is valid.
+// Validate checks that all required Config fields are set, the port is valid,
+// and sslmode is empty or a supported libpq value.
 func (c Config) Validate() error {
 	return c.validate(true)
 }

@@ -19,11 +19,14 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	pgclaim "github.com/opendatahub-io/odh-platform-utilities/framework/postgres"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,6 +35,10 @@ import (
 // consumerCAFile is the in-pod path where claim Secret ca.crt is mounted.
 // Libpq must use this path; WriteCACert would write on the test host.
 const consumerCAFile = "/etc/db-trust/ca.crt"
+
+// accessorConnectionSecretKey holds the Libpq string in a short-lived Secret
+// so the password is not persisted on the Pod spec via EnvVar.Value.
+const accessorConnectionSecretKey = "connection"
 
 // accessorConsumerScript runs the claim-contract insert/select against a
 // connection string composed by framework/postgres. It does not assemble
@@ -72,8 +79,8 @@ func claimLibpqConnection(secret *corev1.Secret, caFile string) (string, pgclaim
 	return conn, params, nil
 }
 
-func expectedSSLFlag(params pgclaim.Params) string {
-	if params.TLSEnabled() {
+func expectedSSLFlag(tlsExpected bool) string {
+	if tlsExpected {
 		return "t"
 	}
 	return "f"
@@ -96,7 +103,12 @@ result=$(psql -X -qAt -v ON_ERROR_STOP=1 "$CONNECTION" <<'SQL'
 CREATE TABLE IF NOT EXISTS search_path_probe (value integer);
 TRUNCATE search_path_probe;
 INSERT INTO search_path_probe VALUES (99);
-SELECT current_schema() || '|' || current_schema() || '|' || (
+SELECT current_schema() || '|' || (
+  SELECT n.nspname
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE c.relname = 'search_path_probe' AND c.relkind = 'r' AND n.nspname = current_schema()
+) || '|' || (
   SELECT CASE WHEN EXISTS (
     SELECT 1
     FROM pg_class c
@@ -126,10 +138,11 @@ func runAccessorConsumer(
 	secret := &corev1.Secret{}
 	g.Expect(cli.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, secret)).To(Succeed())
 
-	connection, params, err := claimLibpqConnection(secret, caFileForConsumer(withCA))
+	connection, _, err := claimLibpqConnection(secret, caFileForConsumer(withCA))
 	g.Expect(err).NotTo(HaveOccurred())
 
-	pod := accessorConsumerPod(namespace, secretName, image, connection, expectedSSLFlag(params), withCA)
+	connSecret := createAccessorConnectionSecret(t, ctx, cli, secret, connection)
+	pod := accessorConsumerPod(namespace, secretName, connSecret, image, expectedSSLFlag(withCA), withCA)
 	runPod(t, ctx, cli, restCfg, pod)
 }
 
@@ -152,12 +165,61 @@ func runAccessorSearchPathConsumer(
 	connection, params, err := claimLibpqConnection(secret, caFileForConsumer(withCA))
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(params.Schema).NotTo(BeEmpty(), "SchemaClaim Secret must carry schema for search_path proof")
-	g.Expect(connection).To(ContainSubstring("options='-csearch_path=" + params.Schema + "'"))
+	g.Expect(strings.Contains(connection, "options='-csearch_path="+params.Schema+"'")).
+		To(BeTrue(), "accessor connection must set the claimed search_path")
 
-	runPod(t, ctx, cli, restCfg, accessorSearchPathPod(namespace, secretName, image, connection, params.Schema, withCA))
+	connSecret := createAccessorConnectionSecret(t, ctx, cli, secret, connection)
+	runPod(t, ctx, cli, restCfg, accessorSearchPathPod(namespace, secretName, connSecret, image, params.Schema, withCA))
 }
 
-func accessorConsumerPod(namespace, secretName, image, connection, expectedSSL string, withCA bool) *corev1.Pod {
+func createAccessorConnectionSecret(
+	t *testing.T,
+	ctx context.Context,
+	cli client.Client,
+	claimSecret *corev1.Secret,
+	connection string,
+) string {
+	t.Helper()
+	g := NewWithT(t)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "accessor-conn-",
+			Namespace:    claimSecret.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Secret",
+				Name:       claimSecret.Name,
+				UID:        claimSecret.UID,
+			}},
+		},
+		Data: map[string][]byte{accessorConnectionSecretKey: []byte(connection)},
+	}
+	g.Expect(cli.Create(ctx, secret)).To(Succeed())
+	t.Cleanup(func() {
+		cleanupCtx, done := context.WithTimeout(context.Background(), 30*time.Second)
+		defer done()
+		err := cli.Delete(cleanupCtx, secret, client.Preconditions{UID: &secret.UID})
+		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			t.Errorf("cleaning accessor connection Secret: %v", err)
+		}
+	})
+	return secret.Name
+}
+
+func connectionFromSecret(secretName string) corev1.EnvVar {
+	return corev1.EnvVar{
+		Name: "CONNECTION",
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+			Key:                  accessorConnectionSecretKey,
+		}},
+	}
+}
+
+func accessorConsumerPod(
+	namespace, claimSecretName, connSecretName, image, expectedSSL string,
+	withCA bool,
+) *corev1.Pod {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "accessor-connection-consumer", Namespace: namespace},
 		Spec: corev1.PodSpec{
@@ -167,17 +229,20 @@ func accessorConsumerPod(namespace, secretName, image, connection, expectedSSL s
 				Image:   image,
 				Command: []string{"/bin/sh", "-ec", accessorConsumerScript},
 				Env: []corev1.EnvVar{
-					{Name: "CONNECTION", Value: connection},
+					connectionFromSecret(connSecretName),
 					{Name: "EXPECTED_SSL", Value: expectedSSL},
 				},
 			}},
 		},
 	}
-	mountClaimCA(pod, secretName, withCA)
+	mountClaimCA(pod, claimSecretName, withCA)
 	return pod
 }
 
-func accessorSearchPathPod(namespace, secretName, image, connection, expectedSchema string, withCA bool) *corev1.Pod {
+func accessorSearchPathPod(
+	namespace, claimSecretName, connSecretName, image, expectedSchema string,
+	withCA bool,
+) *corev1.Pod {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "accessor-search-path-consumer", Namespace: namespace},
 		Spec: corev1.PodSpec{
@@ -187,13 +252,13 @@ func accessorSearchPathPod(namespace, secretName, image, connection, expectedSch
 				Image:   image,
 				Command: []string{"/bin/sh", "-ec", accessorSearchPathScript},
 				Env: []corev1.EnvVar{
-					{Name: "CONNECTION", Value: connection},
+					connectionFromSecret(connSecretName),
 					{Name: "EXPECTED_SCHEMA", Value: expectedSchema},
 				},
 			}},
 		},
 	}
-	mountClaimCA(pod, secretName, withCA)
+	mountClaimCA(pod, claimSecretName, withCA)
 	return pod
 }
 

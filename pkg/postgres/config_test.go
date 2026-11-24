@@ -124,6 +124,76 @@ func TestParseAdminSecret_AllowsMissingDatabase(t *testing.T) {
 	g.Expect(cfg.DBName).To(BeEmpty())
 }
 
+func TestParseSecret_SSLModeAllowList(t *testing.T) {
+	t.Parallel()
+
+	base := map[string][]byte{
+		postgres.SecretKeyHost:     []byte("localhost"),
+		postgres.SecretKeyUser:     []byte("u"),
+		postgres.SecretKeyPassword: []byte("p"),
+		postgres.SecretKeyDatabase: []byte("d"),
+	}
+
+	for _, mode := range []string{
+		"",
+		postgres.SSLModeDisable,
+		postgres.SSLModeAllow,
+		postgres.SSLModePrefer,
+		postgres.SSLModeRequire,
+		postgres.SSLModeVerifyCA,
+		postgres.SSLModeVerifyFull,
+	} {
+		t.Run("accept-"+mode, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			data := cloneSecretData(base)
+			if mode != "" {
+				data[postgres.SecretKeySSLMode] = []byte(mode)
+			}
+			cfg, err := postgres.ParseSecret(data)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(cfg.SSLMode).To(Equal(mode))
+		})
+	}
+
+	t.Run("reject-unknown", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+		data := cloneSecretData(base)
+		data[postgres.SecretKeySSLMode] = []byte("not-a-mode")
+		_, err := postgres.ParseSecret(data)
+		g.Expect(err).To(MatchError(ContainSubstring(postgres.SecretKeySSLMode)))
+		g.Expect(err.Error()).NotTo(ContainSubstring("not-a-mode"))
+	})
+}
+
+func TestParseAdminSecret_AcceptsPreferAndAllowSSLMode(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []string{postgres.SSLModePrefer, postgres.SSLModeAllow} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			cfg, err := postgres.ParseAdminSecret(map[string][]byte{
+				postgres.SecretKeyHost:     []byte("localhost"),
+				postgres.SecretKeyUser:     []byte("u"),
+				postgres.SecretKeyPassword: []byte("p"),
+				postgres.SecretKeySSLMode:  []byte(mode),
+			})
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(cfg.SSLMode).To(Equal(mode))
+		})
+	}
+}
+
+func cloneSecretData(in map[string][]byte) map[string][]byte {
+	out := make(map[string][]byte, len(in))
+	for k, v := range in {
+		out[k] = append([]byte(nil), v...)
+	}
+	return out
+}
+
 // TestParseSecret_DecodesPasswordIntoWrapper verifies the Secret's password
 // bytes land in the typed wrapper and stay readable through Reveal.
 func TestParseSecret_DecodesPasswordIntoWrapper(t *testing.T) {

@@ -17,6 +17,7 @@ limitations under the License.
 package e2e
 
 import (
+	"strings"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -49,11 +50,14 @@ func TestClaimLibpqConnection(t *testing.T) {
 		conn, params, err := claimLibpqConnection(secret, "")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(params.TLSEnabled()).To(BeFalse())
-		g.Expect(expectedSSLFlag(params)).To(Equal("f"))
-		g.Expect(conn).To(ContainSubstring("host='postgres.example.svc'"))
-		g.Expect(conn).To(ContainSubstring("dbname='appdb'"))
-		g.Expect(conn).To(ContainSubstring("sslmode='disable'"))
-		g.Expect(conn).NotTo(ContainSubstring("sslrootcert"))
+		g.Expect(strings.Contains(conn, "host='postgres.example.svc'")).
+			To(BeTrue(), "libpq connection must include host")
+		g.Expect(strings.Contains(conn, "dbname='appdb'")).
+			To(BeTrue(), "libpq connection must include dbname")
+		g.Expect(strings.Contains(conn, "sslmode='disable'")).
+			To(BeTrue(), "libpq connection must set sslmode=disable")
+		g.Expect(strings.Contains(conn, "sslrootcert")).
+			To(BeFalse(), "libpq connection must omit sslrootcert without CA")
 	})
 
 	t.Run("verify-full-with-ca-path", func(t *testing.T) {
@@ -78,10 +82,12 @@ func TestClaimLibpqConnection(t *testing.T) {
 		conn, params, err := claimLibpqConnection(secret, consumerCAFile)
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(params.TLSEnabled()).To(BeTrue())
-		g.Expect(expectedSSLFlag(params)).To(Equal("t"))
-		g.Expect(conn).To(ContainSubstring("sslmode='verify-full'"))
-		g.Expect(conn).To(ContainSubstring("sslrootcert='" + consumerCAFile + "'"))
-		g.Expect(conn).To(ContainSubstring("gssencmode='disable'"))
+		g.Expect(strings.Contains(conn, "sslmode='verify-full'")).
+			To(BeTrue(), "libpq connection must set sslmode=verify-full")
+		g.Expect(strings.Contains(conn, "sslrootcert='"+consumerCAFile+"'")).
+			To(BeTrue(), "libpq connection must set sslrootcert to the in-pod CA path")
+		g.Expect(strings.Contains(conn, "gssencmode='disable'")).
+			To(BeTrue(), "libpq connection must disable GSSAPI encryption")
 	})
 
 	t.Run("schema-sets-search-path", func(t *testing.T) {
@@ -100,7 +106,8 @@ func TestClaimLibpqConnection(t *testing.T) {
 		conn, params, err := claimLibpqConnection(secret, "")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(params.Schema).To(Equal("claim_schema_abc"))
-		g.Expect(conn).To(ContainSubstring("options='-csearch_path=claim_schema_abc'"))
+		g.Expect(strings.Contains(conn, "options='-csearch_path=claim_schema_abc'")).
+			To(BeTrue(), "libpq connection must set the claimed search_path")
 	})
 
 	t.Run("verify-full-rejects-empty-ca-file", func(t *testing.T) {
@@ -135,18 +142,24 @@ func TestAccessorConsumerPod(t *testing.T) {
 			pgclaim.SecretKeyCA:       []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"),
 		},
 	}
-	connection, params, err := claimLibpqConnection(secret, consumerCAFile)
+	_, _, err := claimLibpqConnection(secret, consumerCAFile)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	pod := accessorConsumerPod("claim-ns", "claim-secret", "postgres:16", connection, expectedSSLFlag(params), true)
+	pod := accessorConsumerPod("claim-ns", "claim-secret", "accessor-conn", "postgres:16", expectedSSLFlag(true), true)
 	g.Expect(pod.Name).To(Equal("accessor-connection-consumer"))
 	g.Expect(pod.Namespace).To(Equal("claim-ns"))
 	g.Expect(pod.Spec.Containers).To(HaveLen(1))
 	g.Expect(pod.Spec.Containers[0].Command).To(Equal([]string{"/bin/sh", "-ec", accessorConsumerScript}))
 	g.Expect(pod.Spec.Containers[0].Env).To(ContainElements(
-		corev1.EnvVar{Name: "CONNECTION", Value: connection},
+		connectionFromSecret("accessor-conn"),
 		corev1.EnvVar{Name: "EXPECTED_SSL", Value: "t"},
 	))
+	g.Expect(pod.Spec.Containers[0].Env[0].Value).To(BeEmpty())
+	g.Expect(pod.Spec.Containers[0].Env[0].ValueFrom).NotTo(BeNil())
+	g.Expect(pod.Spec.Containers[0].Env[0].ValueFrom.SecretKeyRef).To(Equal(&corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "accessor-conn"},
+		Key:                  accessorConnectionSecretKey,
+	}))
 	g.Expect(pod.Spec.Volumes).To(HaveLen(1))
 	g.Expect(pod.Spec.Volumes[0].Secret).NotTo(BeNil())
 	g.Expect(pod.Spec.Volumes[0].Secret.SecretName).To(Equal("claim-secret"))
@@ -176,14 +189,16 @@ func TestAccessorSearchPathPod(t *testing.T) {
 	connection, params, err := claimLibpqConnection(secret, "")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(params.Schema).To(Equal("claim_schema_xyz"))
-	g.Expect(connection).To(ContainSubstring("options='-csearch_path=claim_schema_xyz'"))
+	g.Expect(strings.Contains(connection, "options='-csearch_path=claim_schema_xyz'")).
+		To(BeTrue(), "libpq connection must set the claimed search_path")
 
-	pod := accessorSearchPathPod("claim-ns", "schema-secret", "postgres:16", connection, params.Schema, false)
+	pod := accessorSearchPathPod("claim-ns", "schema-secret", "accessor-conn", "postgres:16", params.Schema, false)
 	g.Expect(pod.Name).To(Equal("accessor-search-path-consumer"))
 	g.Expect(pod.Spec.Containers[0].Command).To(Equal([]string{"/bin/sh", "-ec", accessorSearchPathScript}))
 	g.Expect(pod.Spec.Containers[0].Env).To(ContainElements(
-		corev1.EnvVar{Name: "CONNECTION", Value: connection},
+		connectionFromSecret("accessor-conn"),
 		corev1.EnvVar{Name: "EXPECTED_SCHEMA", Value: "claim_schema_xyz"},
 	))
+	g.Expect(pod.Spec.Containers[0].Env[0].Value).To(BeEmpty())
 	g.Expect(pod.Spec.Volumes).To(BeEmpty())
 }
