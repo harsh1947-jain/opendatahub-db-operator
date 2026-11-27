@@ -159,9 +159,8 @@ func TestExternalProviderClaimLifecycle(t *testing.T) {
 	}).WithTimeout(2 * time.Minute).Should(Succeed())
 }
 
-// Prefer/allow: claim Secret keeps the mode; accessor connects over TLS or
-// plaintext. TLS uses ODH_E2E_EXTERNAL_ADMIN_SECRET_*; plaintext uses
-// ODH_E2E_EXTERNAL_PLAINTEXT_ADMIN_SECRET_* (no ca.crt). Skip when unset.
+// TLS fixture: ODH_E2E_EXTERNAL_ADMIN_SECRET_*. Plaintext fixture (no ca.crt):
+// ODH_E2E_EXTERNAL_PLAINTEXT_ADMIN_SECRET_*. Skip when the pair is unset.
 
 func TestExternalPreferAccessorUsesTLS(t *testing.T) {
 	runExternalPreferAllow(t, preferAllowCase{
@@ -235,6 +234,22 @@ func runExternalPreferAllow(t *testing.T, tc preferAllowCase) {
 	}
 
 	adminSecret := createPreferAllowAdminSecret(t, ctx, cli, source, tc.sslMode, tc.withCA)
+	// When a claim exists, its cleanup owns provider/admin Secret deletion after
+	// NotFound. These fallbacks only run if the test fails before that handoff,
+	// so a failed claim wait cannot drop DropRole's dependencies early.
+	claimOwnsBackendCleanup := false
+	t.Cleanup(func() {
+		if claimOwnsBackendCleanup {
+			return
+		}
+		cleanupCtx, done := context.WithTimeout(context.Background(), 30*time.Second)
+		defer done()
+		err := cli.Delete(cleanupCtx, adminSecret, client.Preconditions{UID: &adminSecret.UID})
+		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			t.Errorf("cleaning prefer/allow admin Secret: %v", err)
+		}
+	})
+
 	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "odh-db-prefer-"}}
 	g.Expect(cli.Create(ctx, namespace)).To(Succeed())
 	t.Cleanup(func() {
@@ -258,6 +273,9 @@ func runExternalPreferAllow(t *testing.T, tc preferAllowCase) {
 	}
 	g.Expect(cli.Create(ctx, provider)).To(Succeed())
 	t.Cleanup(func() {
+		if claimOwnsBackendCleanup {
+			return
+		}
 		cleanupCtx, done := context.WithTimeout(context.Background(), time.Minute)
 		defer done()
 		err := cli.Delete(cleanupCtx, provider, client.Preconditions{UID: &provider.UID})
@@ -281,12 +299,28 @@ func runExternalPreferAllow(t *testing.T, tc preferAllowCase) {
 		},
 	}
 	g.Expect(cli.Create(ctx, claim)).To(Succeed())
+	claimOwnsBackendCleanup = true
 	t.Cleanup(func() {
-		cleanupCtx, done := context.WithTimeout(context.Background(), time.Minute)
+		cleanupCtx, done := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer done()
 		err := cli.Delete(cleanupCtx, claim, client.Preconditions{UID: &claim.UID})
 		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 			t.Errorf("cleaning database claim: %v", err)
+			return
+		}
+		NewWithT(t).Eventually(func(g Gomega) {
+			current := &infraapi.DatabaseClaim{}
+			getErr := cli.Get(cleanupCtx, client.ObjectKeyFromObject(claim), current)
+			g.Expect(apierrors.IsNotFound(getErr)).To(BeTrue(), "claim still exists: %v", getErr)
+		}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(Succeed())
+
+		err = cli.Delete(cleanupCtx, provider, client.Preconditions{UID: &provider.UID})
+		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			t.Errorf("cleaning external provider: %v", err)
+		}
+		err = cli.Delete(cleanupCtx, adminSecret, client.Preconditions{UID: &adminSecret.UID})
+		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			t.Errorf("cleaning prefer/allow admin Secret: %v", err)
 		}
 	})
 	g.Eventually(func(g Gomega) {
@@ -307,7 +341,8 @@ func runExternalPreferAllow(t *testing.T, tc preferAllowCase) {
 	if tc.withCA {
 		g.Expect(credentials.Data[postgres.SecretKeyCA]).NotTo(BeEmpty())
 	} else {
-		g.Expect(credentials.Data).NotTo(HaveKey(postgres.SecretKeyCA))
+		_, hasCA := credentials.Data[postgres.SecretKeyCA]
+		g.Expect(hasCA).To(BeFalse(), "plaintext claim Secret must omit ca.crt")
 	}
 
 	connection, params, err := claimLibpqConnection(credentials, caFileForConsumer(tc.withCA))
@@ -352,13 +387,5 @@ func createPreferAllowAdminSecret(
 		Data: data,
 	}
 	g.Expect(cli.Create(ctx, secret)).To(Succeed())
-	t.Cleanup(func() {
-		cleanupCtx, done := context.WithTimeout(context.Background(), 30*time.Second)
-		defer done()
-		err := cli.Delete(cleanupCtx, secret, client.Preconditions{UID: &secret.UID})
-		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
-			t.Errorf("cleaning prefer/allow admin Secret: %v", err)
-		}
-	})
 	return secret
 }
